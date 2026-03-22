@@ -1,4 +1,6 @@
+import os
 import re
+import tempfile
 import time
 from pathlib import Path
 
@@ -36,32 +38,6 @@ def get_hwp_files(input_dir, output_path=None):
 
     normalized_output = normalize_output_path(output_path)
     return [path for path in files if path.resolve() != normalized_output]
-
-
-def get_hwp_application(visible):
-    try:
-        import win32com.client
-    except ImportError as exc:
-        raise RuntimeError("pywin32가 설치되어 있지 않습니다. `pip install pywin32` 후 다시 실행하세요.") from exc
-
-    try:
-        hwp = win32com.client.gencache.EnsureDispatch("HWPFrame.HwpObject")
-    except Exception as exc:
-        raise RuntimeError("한글(HWP) COM 객체를 열지 못했습니다. 한글이 설치되어 있는지 확인해 주세요.") from exc
-
-    try:
-        hwp.XHwpWindows.Item(0).Visible = visible
-    except Exception:
-        pass
-
-    try:
-        hwp.RegisterModule("FilePathCheckDLL", "SecurityModule")
-    except Exception:
-        pass
-
-    return hwp
-
-
 def emit_progress(progress_callback, payload):
     if progress_callback:
         progress_callback(payload)
@@ -74,6 +50,18 @@ def emit_log(logger, message):
         print(message)
 
 
+def make_temp_output_path(output_path):
+    fd, temp_path_str = tempfile.mkstemp(
+        prefix=f"{output_path.stem}_working_",
+        suffix=output_path.suffix,
+        dir=output_path.parent,
+    )
+    os.close(fd)
+    temp_path = Path(temp_path_str)
+    temp_path.unlink(missing_ok=True)
+    return temp_path
+
+
 def prepare_boundary_for_insert(hwp, insert_page_break):
     hwp.Run("MoveDocEnd")
     time.sleep(0.15)
@@ -81,6 +69,72 @@ def prepare_boundary_for_insert(hwp, insert_page_break):
     if insert_page_break:
         hwp.HAction.Run("BreakPage")
         time.sleep(0.1)
+
+
+def set_hwp_visible(hwp, visible):
+    try:
+        hwp.XHwpWindows.Item(0).Visible = visible
+        return True
+    except Exception:
+        return False
+
+
+def get_hwp_application(visible, logger=None, progress_callback=None):
+    try:
+        import win32com.client
+    except ImportError as exc:
+        raise RuntimeError("pywin32가 설치되어 있지 않습니다. `pip install pywin32` 후 다시 실행하세요.") from exc
+
+    try:
+        hwp = win32com.client.gencache.EnsureDispatch("HWPFrame.HwpObject")
+    except Exception as exc:
+        raise RuntimeError("한글(HWP) COM 객체를 열지 못했습니다. 한글이 설치되어 있는지 확인해 주세요.") from exc
+
+    effective_visible = visible
+    if not set_hwp_visible(hwp, visible):
+        emit_log(logger, "[경고] 한글 창 표시 상태를 설정하지 못했습니다.")
+        emit_progress(
+            progress_callback,
+            {"type": "warning", "message": "한글 창 표시 상태를 설정하지 못했습니다."},
+        )
+
+    security_module_registered = False
+    try:
+        hwp.RegisterModule("FilePathCheckDLL", "SecurityModule")
+        security_module_registered = True
+    except Exception:
+        emit_log(
+            logger,
+            "[경고] 보안 모듈 등록에 실패했습니다. 파일 확인창이 숨겨져 멈춰 보이는 일을 막기 위해 한글 창을 표시합니다.",
+        )
+        emit_progress(
+            progress_callback,
+            {
+                "type": "warning",
+                "message": "보안 모듈 등록에 실패해 한글 창을 표시 모드로 전환했습니다.",
+            },
+        )
+        if not visible:
+            if set_hwp_visible(hwp, True):
+                effective_visible = True
+                emit_log(logger, "[안내] 한글 창 표시 모드로 자동 전환되었습니다.")
+            else:
+                emit_log(
+                    logger,
+                    "[경고] 한글 창도 표시하지 못했습니다. 환경에 따라 확인창이 보이지 않아 멈춰 보일 수 있습니다.",
+                )
+                emit_progress(
+                    progress_callback,
+                    {
+                        "type": "warning",
+                        "message": "한글 창 표시 전환에도 실패했습니다. 숨은 확인창을 확인해 주세요.",
+                    },
+                )
+
+    return hwp, {
+        "effective_visible": effective_visible,
+        "security_module_registered": security_module_registered,
+    }
 
 
 def merge_hwp_files(
@@ -100,6 +154,8 @@ def merge_hwp_files(
 
     if not output_path.parent.exists():
         raise RuntimeError(f"출력 폴더를 찾을 수 없습니다: {output_path.parent}")
+
+    temp_output_path = make_temp_output_path(output_path)
 
     all_hwp_files = scan_hwp_files(input_dir)
     matching_output = [path for path in all_hwp_files if path.resolve() == output_path]
@@ -129,6 +185,8 @@ def merge_hwp_files(
             "[주의] 출력 파일이 입력 폴더 안에 이미 있습니다. 이 파일은 입력 목록에서 제외하고 덮어씁니다.",
         )
 
+    emit_log(logger, f"임시 작업 파일: {temp_output_path}")
+
     pythoncom = None
     try:
         import pythoncom as _pythoncom
@@ -138,9 +196,10 @@ def merge_hwp_files(
     except ImportError:
         pythoncom = None
 
-    hwp = get_hwp_application(visible=visible)
+    hwp, hwp_runtime = get_hwp_application(visible=visible, logger=logger, progress_callback=progress_callback)
     success_count = 0
     fail_list = []
+    fatal_error = None
 
     try:
         first_file = file_list[0]
@@ -152,10 +211,7 @@ def merge_hwp_files(
         hwp.Open(str(first_file))
         time.sleep(1.5)
 
-        if output_path.exists():
-            output_path.unlink()
-
-        hwp.SaveAs(str(output_path))
+        hwp.SaveAs(str(temp_output_path))
         time.sleep(0.8)
         success_count = 1
         emit_log(logger, "  결과 파일 생성 완료")
@@ -215,6 +271,9 @@ def merge_hwp_files(
         emit_progress(progress_callback, {"type": "final_save", "total": total_files})
         hwp.Save()
         time.sleep(1.0)
+    except Exception as exc:
+        fatal_error = exc
+        raise
     finally:
         try:
             hwp.Quit()
@@ -224,8 +283,18 @@ def merge_hwp_files(
         if pythoncom is not None:
             pythoncom.CoUninitialize()
 
-    if not output_path.exists():
+    if fatal_error is not None and temp_output_path.exists():
+        emit_log(logger, f"[안내] 임시 결과 파일이 남아 있습니다: {temp_output_path}")
+
+    if not temp_output_path.exists():
         raise RuntimeError("결과 파일 저장에 실패했습니다.")
+
+    try:
+        temp_output_path.replace(output_path)
+    except Exception as exc:
+        raise RuntimeError(
+            f"최종 결과 파일 교체에 실패했습니다. 임시 결과는 여기 남아 있습니다: {temp_output_path}"
+        ) from exc
 
     file_size_mb = output_path.stat().st_size / (1024 * 1024)
     emit_log(logger, "병합 완료!")
@@ -244,6 +313,8 @@ def merge_hwp_files(
         "total_files": total_files,
         "fail_list": fail_list,
         "file_size_mb": file_size_mb,
+        "effective_visible": hwp_runtime["effective_visible"],
+        "security_module_registered": hwp_runtime["security_module_registered"],
     }
     emit_progress(
         progress_callback,

@@ -5,7 +5,13 @@ from pathlib import Path
 from tkinter import BooleanVar, IntVar, StringVar, Tk, messagebox, ttk, filedialog
 import tkinter as tk
 
-from hwp_merge_core import OUTPUT_NAME_DEFAULT, SAVE_INTERVAL_DEFAULT, merge_hwp_files, normalize_output_path, scan_hwp_files
+from hwp_merge_core import (
+    OUTPUT_NAME_DEFAULT,
+    SAVE_INTERVAL_DEFAULT,
+    get_hwp_files,
+    merge_hwp_files,
+    normalize_output_path,
+)
 
 
 class HwpMergerApp:
@@ -25,9 +31,11 @@ class HwpMergerApp:
 
         self.last_auto_output = None
         self.running = False
+        self.worker = None
         self.message_queue = queue.Queue()
         self.last_output_path = None
 
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.build_ui()
         self.root.after(100, self.process_queue)
 
@@ -147,22 +155,33 @@ class HwpMergerApp:
             self.file_count_var.set("대상 파일: 폴더를 선택해 주세요")
             return
 
-        try:
-            files = scan_hwp_files(input_dir)
-            self.file_count_var.set(f"대상 파일: {len(files)}개 .hwp 파일")
-        except Exception as exc:
-            self.file_count_var.set(f"대상 파일: 확인 실패 ({exc})")
-            return
-
         current_output = self.output_path_var.get().strip()
         if not current_output or current_output == self.last_auto_output:
             default_output = Path(input_dir).expanduser() / OUTPUT_NAME_DEFAULT
             self.last_auto_output = str(default_output)
             self.output_path_var.set(self.last_auto_output)
+            return
+
+        self.refresh_file_count()
 
     def on_output_path_changed(self, *_args):
         if not self.output_path_var.get().strip():
             self.last_auto_output = None
+
+        self.refresh_file_count()
+
+    def refresh_file_count(self):
+        input_dir = self.input_dir_var.get().strip()
+        if not input_dir:
+            self.file_count_var.set("대상 파일: 폴더를 선택해 주세요")
+            return
+
+        output_candidate = self.output_path_var.get().strip() or None
+        try:
+            files = get_hwp_files(input_dir, output_candidate)
+            self.file_count_var.set(f"대상 파일: {len(files)}개 .hwp 파일")
+        except Exception as exc:
+            self.file_count_var.set(f"대상 파일: 확인 실패 ({exc})")
 
     def append_log(self, message):
         self.log_text.configure(state="normal")
@@ -199,7 +218,7 @@ class HwpMergerApp:
             raise RuntimeError("출력 파일 위치를 지정해 주세요.")
 
         normalized_output = normalize_output_path(output_path)
-        existing_inputs = scan_hwp_files(input_dir)
+        existing_inputs = get_hwp_files(input_dir)
         conflicting_inputs = [path for path in existing_inputs if path.resolve() == normalized_output]
 
         if conflicting_inputs:
@@ -245,8 +264,8 @@ class HwpMergerApp:
                 self.show_hwp_var.get(),
                 self.insert_page_break_var.get(),
             ),
-            daemon=True,
         )
+        self.worker = worker
         worker.start()
 
     def run_merge_worker(self, input_dir, output_path, save_interval, visible, insert_page_break):
@@ -318,6 +337,10 @@ class HwpMergerApp:
             self.status_var.set("최종 저장 중...")
             return
 
+        if event_type == "warning":
+            self.status_var.set(payload.get("message", "경고가 발생했습니다."))
+            return
+
         if event_type == "completed":
             self.status_var.set(
                 f"완료: 성공 {payload.get('success_count', 0)}개, 실패 {payload.get('fail_count', 0)}개"
@@ -325,15 +348,20 @@ class HwpMergerApp:
 
     def handle_done(self, result):
         self.running = False
+        self.worker = None
         self.last_output_path = Path(result["output_path"])
         self.set_controls_state(True)
         self.status_var.set(
             f"병합 완료: {result['success_count']}/{result['total_files']}개 성공, 결과 {self.last_output_path.name}"
         )
-        messagebox.showinfo("병합 완료", f"결과 파일이 생성되었습니다.\n\n{self.last_output_path}")
+        done_message = f"결과 파일이 생성되었습니다.\n\n{self.last_output_path}"
+        if not result.get("security_module_registered", True):
+            done_message += "\n\n보안 모듈 등록에 실패해 병합 중 한글 창 표시 모드로 전환되었습니다."
+        messagebox.showinfo("병합 완료", done_message)
 
     def handle_error(self, message):
         self.running = False
+        self.worker = None
         self.set_controls_state(True)
         self.status_var.set("오류로 중단됨")
         self.append_log(f"[오류] {message}")
@@ -347,6 +375,16 @@ class HwpMergerApp:
             subprocess.Popen(["explorer", str(self.last_output_path.parent)])
         except Exception as exc:
             messagebox.showerror("폴더 열기 실패", str(exc))
+
+    def on_close(self):
+        if self.running:
+            messagebox.showwarning(
+                "병합 진행 중",
+                "병합이 진행 중일 때는 창을 닫을 수 없습니다.\n완료 후 닫아 주세요.",
+            )
+            return
+
+        self.root.destroy()
 
 
 def main():
