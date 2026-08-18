@@ -4,6 +4,7 @@ import threading
 from pathlib import Path
 from tkinter import BooleanVar, IntVar, StringVar, Tk, messagebox, ttk, filedialog
 import tkinter as tk
+import pythoncom
 
 from hwp_merge_core import (
     OUTPUT_NAME_DEFAULT,
@@ -12,14 +13,31 @@ from hwp_merge_core import (
     merge_hwp_files,
     normalize_output_path,
 )
+from hwp_split_core import (
+    SPLIT_MODE_AUTO,
+    SPLIT_MODE_N_PAGES,
+    SPLIT_MODE_N_FILES,
+    SPLIT_MODE_TABLE_NAME,
+    parse_items_from_hwp,
+    build_page_ranges_from_starts,
+    build_page_ranges_n_pages,
+    build_page_ranges_n_files,
+    detect_page_breaks_from_open_doc,
+    execute_split_by_plan,
+)
 
 
-class HwpMergerApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("HWP 파일 병합기")
-        self.root.geometry("780x620")
-        self.root.minsize(720, 560)
+# ---------------------------------------------------------------------------
+# 병합 탭
+# ---------------------------------------------------------------------------
+
+class MergeTab:
+    def __init__(self, parent_notebook):
+        self.frame = ttk.Frame(parent_notebook)
+        parent_notebook.add(self.frame, text="📄 병합")
+
+        self.frame.columnconfigure(0, weight=1)
+        self.frame.rowconfigure(2, weight=1)
 
         self.input_dir_var = StringVar()
         self.output_path_var = StringVar()
@@ -35,15 +53,10 @@ class HwpMergerApp:
         self.message_queue = queue.Queue()
         self.last_output_path = None
 
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.build_ui()
-        self.root.after(100, self.process_queue)
+        self._build_ui()
 
-    def build_ui(self):
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(2, weight=1)
-
-        file_frame = ttk.LabelFrame(self.root, text="파일 설정", padding=14)
+    def _build_ui(self):
+        file_frame = ttk.LabelFrame(self.frame, text="파일 설정", padding=14)
         file_frame.grid(row=0, column=0, padx=16, pady=(16, 10), sticky="nsew")
         file_frame.columnconfigure(1, weight=1)
 
@@ -62,7 +75,7 @@ class HwpMergerApp:
         self.file_count_label = ttk.Label(file_frame, textvariable=self.file_count_var)
         self.file_count_label.grid(row=2, column=0, columnspan=3, sticky="w")
 
-        option_frame = ttk.LabelFrame(self.root, text="옵션", padding=14)
+        option_frame = ttk.LabelFrame(self.frame, text="옵션", padding=14)
         option_frame.grid(row=1, column=0, padx=16, pady=(0, 10), sticky="ew")
         option_frame.columnconfigure(3, weight=1)
 
@@ -89,314 +102,665 @@ class HwpMergerApp:
 
         action_frame = ttk.Frame(option_frame)
         action_frame.grid(row=0, column=3, rowspan=3, sticky="e")
-        self.start_button = ttk.Button(action_frame, text="병합 시작", command=self.start_merge)
-        self.start_button.grid(row=0, column=0, padx=(10, 0))
-        self.open_output_button = ttk.Button(action_frame, text="결과 폴더 열기", command=self.open_output_folder, state="disabled")
-        self.open_output_button.grid(row=0, column=1, padx=(8, 0))
 
-        log_frame = ttk.LabelFrame(self.root, text="진행 상태", padding=14)
+        self.merge_button = ttk.Button(action_frame, text="병합 시작", command=self.start_merge)
+        self.merge_button.pack(side="top", fill="x", pady=(0, 6))
+
+        self.open_button = ttk.Button(action_frame, text="결과 파일 열기", command=self.open_result)
+        self.open_button.pack(side="top", fill="x")
+
+        log_frame = ttk.LabelFrame(self.frame, text="진행 상황", padding=14)
         log_frame.grid(row=2, column=0, padx=16, pady=(0, 16), sticky="nsew")
         log_frame.columnconfigure(0, weight=1)
         log_frame.rowconfigure(2, weight=1)
 
-        self.status_label = ttk.Label(log_frame, textvariable=self.status_var)
-        self.status_label.grid(row=0, column=0, sticky="w")
+        status_row = ttk.Frame(log_frame)
+        status_row.grid(row=0, column=0, sticky="ew")
+        status_row.columnconfigure(1, weight=1)
 
-        self.progressbar = ttk.Progressbar(log_frame, mode="determinate")
-        self.progressbar.grid(row=1, column=0, sticky="ew", pady=(10, 12))
+        ttk.Label(status_row, text="상태:").grid(row=0, column=0, sticky="w")
+        ttk.Label(status_row, textvariable=self.status_var).grid(row=0, column=1, sticky="w", padx=(6, 0))
 
-        log_inner = ttk.Frame(log_frame)
-        log_inner.grid(row=2, column=0, sticky="nsew")
-        log_inner.columnconfigure(0, weight=1)
-        log_inner.rowconfigure(0, weight=1)
+        self.progress_bar = ttk.Progressbar(log_frame, mode="determinate")
+        self.progress_bar.grid(row=1, column=0, sticky="ew", pady=(8, 8))
 
-        self.log_text = tk.Text(log_inner, wrap="word", height=18, state="disabled")
-        self.log_text.grid(row=0, column=0, sticky="nsew")
-        scrollbar = ttk.Scrollbar(log_inner, orient="vertical", command=self.log_text.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        self.log_text.configure(yscrollcommand=scrollbar.set)
-
-        self.input_dir_var.trace_add("write", self.on_input_dir_changed)
-        self.output_path_var.trace_add("write", self.on_output_path_changed)
+        self.log_text = tk.Text(log_frame, height=10, state="disabled", wrap="word")
+        self.log_text.grid(row=2, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(log_frame, command=self.log_text.yview)
+        scrollbar.grid(row=2, column=1, sticky="ns")
+        self.log_text["yscrollcommand"] = scrollbar.set
 
     def select_input_dir(self):
-        selected = filedialog.askdirectory(title="병합할 한글 파일 폴더를 선택하세요")
-        if not selected:
+        d = filedialog.askdirectory(title="병합할 HWP 파일이 있는 폴더 선택")
+        if not d:
             return
-
-        self.input_dir_var.set(selected)
+        self.input_dir_var.set(d)
+        output_path = self.output_path_var.get().strip()
+        if not output_path or output_path == str(self.last_auto_output):
+            auto = Path(d) / OUTPUT_NAME_DEFAULT
+            self.output_path_var.set(str(auto))
+            self.last_auto_output = auto
+        self._refresh_file_count()
 
     def select_output_file(self):
-        initial_dir = self.input_dir_var.get().strip() or str(Path.cwd())
-        initial_file = OUTPUT_NAME_DEFAULT
-
-        current_value = self.output_path_var.get().strip()
-        if current_value:
-            current_path = Path(current_value)
-            initial_dir = str(current_path.parent)
-            initial_file = current_path.name
-
-        selected = filedialog.asksaveasfilename(
-            title="결과 파일 저장 위치 선택",
-            initialdir=initial_dir,
-            initialfile=initial_file,
+        f = filedialog.asksaveasfilename(
+            title="저장할 파일 위치 선택",
             defaultextension=".hwp",
-            filetypes=[("한글 파일", "*.hwp")],
+            filetypes=[("HWP 파일", "*.hwp")],
         )
-        if not selected:
-            return
+        if f:
+            self.output_path_var.set(f)
 
-        self.last_auto_output = None
-        self.output_path_var.set(selected)
-
-    def on_input_dir_changed(self, *_args):
+    def _refresh_file_count(self):
         input_dir = self.input_dir_var.get().strip()
         if not input_dir:
             self.file_count_var.set("대상 파일: 폴더를 선택해 주세요")
             return
-
-        current_output = self.output_path_var.get().strip()
-        if not current_output or current_output == self.last_auto_output:
-            default_output = Path(input_dir).expanduser() / OUTPUT_NAME_DEFAULT
-            self.last_auto_output = str(default_output)
-            self.output_path_var.set(self.last_auto_output)
-            return
-
-        self.refresh_file_count()
-
-    def on_output_path_changed(self, *_args):
-        if not self.output_path_var.get().strip():
-            self.last_auto_output = None
-
-        self.refresh_file_count()
-
-    def refresh_file_count(self):
-        input_dir = self.input_dir_var.get().strip()
-        if not input_dir:
-            self.file_count_var.set("대상 파일: 폴더를 선택해 주세요")
-            return
-
-        output_candidate = self.output_path_var.get().strip() or None
         try:
-            files = get_hwp_files(input_dir, output_candidate)
-            self.file_count_var.set(f"대상 파일: {len(files)}개 .hwp 파일")
+            files = get_hwp_files(input_dir, self.output_path_var.get().strip() or None)
+            self.file_count_var.set(f"대상 파일: {len(files)}개")
         except Exception as exc:
-            self.file_count_var.set(f"대상 파일: 확인 실패 ({exc})")
+            self.file_count_var.set(f"오류: {exc}")
 
-    def append_log(self, message):
-        self.log_text.configure(state="normal")
+    def _set_ui_running(self, running):
+        state = "disabled" if running else "normal"
+        self.merge_button.config(state=state)
+        self.open_button.config(state="disabled" if running else "normal")
+        self.input_button.config(state=state)
+        self.output_button.config(state=state)
+        self.save_interval_spinbox.config(state=state)
+        self.show_hwp_check.config(state=state)
+        self.page_break_check.config(state=state)
+        self.running = running
+
+    def _append_log(self, message):
+        self.log_text.config(state="normal")
         self.log_text.insert("end", message + "\n")
         self.log_text.see("end")
-        self.log_text.configure(state="disabled")
+        self.log_text.config(state="disabled")
 
-    def set_controls_state(self, enabled):
-        state = "normal" if enabled else "disabled"
-        for widget in [
-            self.input_entry,
-            self.output_entry,
-            self.input_button,
-            self.output_button,
-            self.save_interval_spinbox,
-            self.show_hwp_check,
-            self.page_break_check,
-            self.start_button,
-        ]:
-            widget.configure(state=state)
+    def _clear_log(self):
+        self.log_text.config(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.config(state="disabled")
 
-        if enabled and self.last_output_path:
-            self.open_output_button.configure(state="normal")
-        else:
-            self.open_output_button.configure(state="disabled")
-
-    def validate_paths(self):
+    def start_merge(self):
         input_dir = self.input_dir_var.get().strip()
         output_path = self.output_path_var.get().strip()
 
         if not input_dir:
-            raise RuntimeError("입력 폴더를 선택해 주세요.")
+            messagebox.showwarning("경고", "입력 폴더를 선택해 주세요.")
+            return
         if not output_path:
-            raise RuntimeError("출력 파일 위치를 지정해 주세요.")
-
-        normalized_output = normalize_output_path(output_path)
-        existing_inputs = get_hwp_files(input_dir)
-        conflicting_inputs = [path for path in existing_inputs if path.resolve() == normalized_output]
-
-        if conflicting_inputs:
-            proceed = messagebox.askyesno(
-                "덮어쓰기 확인",
-                "선택한 출력 파일이 입력 폴더 안의 기존 HWP 파일과 같습니다.\n"
-                "이 파일은 입력 목록에서 제외되고 덮어써집니다.\n\n계속하시겠습니까?",
-            )
-            if not proceed:
-                raise RuntimeError("다른 출력 파일을 선택해 주세요.")
-
-        return Path(input_dir).expanduser().resolve(), normalized_output
-
-    def start_merge(self):
-        if self.running:
+            messagebox.showwarning("경고", "출력 파일 경로를 입력해 주세요.")
             return
 
+        self._clear_log()
+        self._set_ui_running(True)
+        self.status_var.set("병합 준비 중…")
+        self.progress_bar["value"] = 0
+
+        params = {
+            "input_dir": input_dir,
+            "output_path": output_path,
+            "visible": self.show_hwp_var.get(),
+            "insert_page_break": self.insert_page_break_var.get(),
+            "save_interval": self.save_interval_var.get(),
+        }
+        self.worker = threading.Thread(target=self._merge_worker, kwargs=params, daemon=True)
+        self.worker.start()
+        self.frame.after(100, self._process_queue)
+
+    def _merge_worker(self, input_dir, output_path, visible, insert_page_break, save_interval):
+        pythoncom.CoInitialize()
+        q = self.message_queue
+
+        def logger(msg):
+            q.put({"type": "log", "message": msg})
+
+        def progress_callback(payload):
+            q.put(payload)
+
         try:
-            input_dir, output_path = self.validate_paths()
-            save_interval = int(self.save_interval_var.get())
-            if save_interval < 0:
-                raise RuntimeError("중간 저장 간격은 0 이상이어야 합니다.")
-        except Exception as exc:
-            messagebox.showerror("실행할 수 없습니다", str(exc))
-            return
-
-        self.running = True
-        self.last_output_path = None
-        self.set_controls_state(False)
-        self.progressbar["value"] = 0
-        self.progressbar["maximum"] = 1
-        self.status_var.set("병합 준비 중")
-        self.append_log("")
-        self.append_log("=" * 70)
-        self.append_log("새 병합 작업을 시작합니다.")
-
-        worker = threading.Thread(
-            target=self.run_merge_worker,
-            args=(
-                input_dir,
-                output_path,
-                save_interval,
-                self.show_hwp_var.get(),
-                self.insert_page_break_var.get(),
-            ),
-        )
-        self.worker = worker
-        worker.start()
-
-    def run_merge_worker(self, input_dir, output_path, save_interval, visible, insert_page_break):
-        try:
-            result = merge_hwp_files(
+            merge_hwp_files(
                 input_dir=input_dir,
                 output_path=output_path,
-                save_interval=save_interval,
                 visible=visible,
                 insert_page_break=insert_page_break,
-                logger=lambda message: self.message_queue.put(("log", message)),
-                progress_callback=lambda payload: self.message_queue.put(("progress", payload)),
+                save_interval=save_interval,
+                logger=logger,
+                progress_callback=progress_callback,
             )
-            self.message_queue.put(("done", result))
         except Exception as exc:
-            self.message_queue.put(("error", str(exc)))
+            q.put({"type": "error", "message": str(exc)})
+        finally:
+            pythoncom.CoUninitialize()
+            q.put({"type": "done"})
 
-    def process_queue(self):
+    def _process_queue(self):
         try:
             while True:
-                kind, payload = self.message_queue.get_nowait()
-                if kind == "log":
-                    self.append_log(payload)
-                elif kind == "progress":
-                    self.handle_progress(payload)
-                elif kind == "done":
-                    self.handle_done(payload)
-                elif kind == "error":
-                    self.handle_error(payload)
-        except queue.Empty:
+                msg = self.message_queue.get_nowait()
+                mtype = msg.get("type")
+
+                if mtype == "log":
+                    self._append_log(msg["message"])
+
+                elif mtype == "progress":
+                    total = msg.get("total", 0)
+                    current = msg.get("current", 0)
+                    if total:
+                        self.progress_bar["maximum"] = total
+                        self.progress_bar["value"] = current
+                    status = msg.get("status", "")
+                    if status:
+                        self.status_var.set(status)
+
+                elif mtype == "warning":
+                    self._append_log(f"[경고] {msg['message']}")
+
+                elif mtype == "error":
+                    self._append_log(f"[오류] {msg['message']}")
+                    messagebox.showerror("오류", msg["message"])
+                    self._set_ui_running(False)
+                    self.status_var.set("오류 발생")
+
+                elif mtype == "done":
+                    self._set_ui_running(False)
+                    self.status_var.set("완료")
+                    output_path = self.output_path_var.get().strip()
+                    self.last_output_path = output_path
+                    if output_path and Path(output_path).exists():
+                        if messagebox.askyesno("완료", "병합이 완료되었습니다.\n결과 파일을 여시겠습니까?"):
+                            self.open_result()
+        except Exception:
             pass
+        finally:
+            if self.running:
+                self.frame.after(100, self._process_queue)
 
-        self.root.after(100, self.process_queue)
-
-    def handle_progress(self, payload):
-        event_type = payload.get("type")
-
-        if event_type == "scan_complete":
-            total = max(payload.get("total", 1), 1)
-            self.progressbar["maximum"] = total
-            self.progressbar["value"] = 0
-            self.status_var.set(f"파일 확인 완료: 총 {payload.get('total', 0)}개")
+    def open_result(self):
+        path = self.last_output_path or self.output_path_var.get().strip()
+        if not path or not Path(path).exists():
+            messagebox.showwarning("경고", "열 파일이 없습니다.")
             return
+        subprocess.Popen(["start", "", path], shell=True)
 
-        if event_type == "file_start":
-            index = payload.get("index", 0)
-            total = max(payload.get("total", 1), 1)
-            self.progressbar["maximum"] = total
-            self.progressbar["value"] = max(index - 1, 0)
-            self.status_var.set(f"[{index}/{total}] 처리 중: {payload.get('file_name', '')}")
-            return
+    def on_close_check(self):
+        if self.running:
+            if not messagebox.askyesno("종료 확인", "병합이 진행 중입니다. 종료하시겠습니까?"):
+                return False
+        return True
 
-        if event_type == "file_done":
-            index = payload.get("index", 0)
-            total = max(payload.get("total", 1), 1)
-            self.progressbar["maximum"] = total
-            self.progressbar["value"] = index
-            if payload.get("success"):
-                self.status_var.set(f"[{index}/{total}] 완료: {payload.get('file_name', '')}")
-            else:
-                self.status_var.set(f"[{index}/{total}] 실패 기록: {payload.get('file_name', '')}")
-            return
 
-        if event_type == "intermediate_save":
-            self.status_var.set(f"중간 저장 중... ({payload.get('index', 0)}개 완료)")
-            return
+# ---------------------------------------------------------------------------
+# 분리 탭
+# ---------------------------------------------------------------------------
 
-        if event_type == "final_save":
-            self.status_var.set("최종 저장 중...")
-            return
+class SplitTab:
+    def __init__(self, parent_notebook):
+        self.frame = ttk.Frame(parent_notebook)
+        parent_notebook.add(self.frame, text="✂️ 분리")
 
-        if event_type == "warning":
-            self.status_var.set(payload.get("message", "경고가 발생했습니다."))
-            return
+        self.frame.columnconfigure(0, weight=1)
+        self.frame.rowconfigure(3, weight=1)
 
-        if event_type == "completed":
-            self.status_var.set(
-                f"완료: 성공 {payload.get('success_count', 0)}개, 실패 {payload.get('fail_count', 0)}개"
+        self.input_file_var = StringVar()
+        self.output_dir_var = StringVar()
+        self.status_var = StringVar(value="대기 중")
+        self.show_hwp_var = BooleanVar(value=False)
+
+        self.split_mode_var = StringVar(value=SPLIT_MODE_TABLE_NAME)
+        self.n_var = IntVar(value=1)
+        self.pattern_var = StringVar(value="{name}")
+
+        self._preview_ranges = []
+        self._preview_names = []
+
+        self.running = False
+        self.worker = None
+        self.message_queue = queue.Queue()
+
+        self._build_ui()
+
+    def _build_ui(self):
+        file_frame = ttk.LabelFrame(self.frame, text="파일 설정", padding=12)
+        file_frame.grid(row=0, column=0, padx=14, pady=(12, 8), sticky="nsew")
+        file_frame.columnconfigure(1, weight=1)
+
+        ttk.Label(file_frame, text="입력 파일").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self.input_entry = ttk.Entry(file_frame, textvariable=self.input_file_var)
+        self.input_entry.grid(row=0, column=1, sticky="ew", padx=(10, 8), pady=(0, 6))
+        self.input_button = ttk.Button(file_frame, text="파일 선택", command=self.select_input_file)
+        self.input_button.grid(row=0, column=2, sticky="ew", pady=(0, 6))
+
+        ttk.Label(file_frame, text="출력 폴더").grid(row=1, column=0, sticky="w")
+        self.output_entry = ttk.Entry(file_frame, textvariable=self.output_dir_var)
+        self.output_entry.grid(row=1, column=1, sticky="ew", padx=(10, 8))
+        self.output_dir_button = ttk.Button(file_frame, text="폴더 선택", command=self.select_output_dir)
+        self.output_dir_button.grid(row=1, column=2, sticky="ew")
+
+        option_frame = ttk.LabelFrame(self.frame, text="분리 모드", padding=12)
+        option_frame.grid(row=1, column=0, padx=14, pady=(0, 8), sticky="ew")
+        option_frame.columnconfigure(3, weight=1)
+
+        modes = [
+            (SPLIT_MODE_TABLE_NAME, "📋 [도면 명칭 + 유적명] 표 기준 자동 분리 (권장)"),
+            (SPLIT_MODE_AUTO,       "📄 페이지 나누기 마커 기준 분리"),
+            (SPLIT_MODE_N_PAGES,    "🔢 N페이지마다 균등 분리"),
+            (SPLIT_MODE_N_FILES,    "➗ 총 N개 파일로 균등 분리"),
+        ]
+        for idx, (mode_val, label) in enumerate(modes):
+            rb = ttk.Radiobutton(
+                option_frame,
+                text=label,
+                variable=self.split_mode_var,
+                value=mode_val,
+                command=self._on_mode_change,
             )
+            rb.grid(row=idx // 2, column=(idx % 2) * 2, columnspan=2, sticky="w", padx=(0, 10), pady=3)
 
-    def handle_done(self, result):
-        self.running = False
-        self.worker = None
-        self.last_output_path = Path(result["output_path"])
-        self.set_controls_state(True)
-        self.status_var.set(
-            f"병합 완료: {result['success_count']}/{result['total_files']}개 성공, 결과 {self.last_output_path.name}"
+        self.detail_frame = ttk.Frame(option_frame, padding=(0, 6, 0, 0))
+        self.detail_frame.grid(row=2, column=0, columnspan=4, sticky="ew")
+        self.detail_frame.columnconfigure(1, weight=1)
+
+        self.n_label = ttk.Label(self.detail_frame, text="페이지/파일 수(N):")
+        self.n_label.grid(row=0, column=0, sticky="w", pady=2)
+        self.n_spinbox = ttk.Spinbox(self.detail_frame, from_=1, to=9999, textvariable=self.n_var, width=8)
+        self.n_spinbox.grid(row=0, column=1, sticky="w", padx=(8, 0), pady=2)
+
+        self.pat_label = ttk.Label(self.detail_frame, text="파일명 서식 패턴:")
+        self.pat_label.grid(row=1, column=0, sticky="w", pady=2)
+        self.pat_entry = ttk.Entry(self.detail_frame, textvariable=self.pattern_var)
+        self.pat_entry.grid(row=1, column=1, sticky="ew", padx=(8, 0), pady=2)
+        ttk.Label(self.detail_frame, text="기본: {name}", foreground="gray").grid(row=1, column=2, sticky="w", padx=(6, 0))
+
+        btn_box = ttk.Frame(option_frame)
+        btn_box.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        btn_box.columnconfigure(0, weight=1)
+        btn_box.columnconfigure(1, weight=1)
+        btn_box.columnconfigure(2, weight=1)
+
+        self.preview_button = ttk.Button(btn_box, text="🔍 미리보기 / 표 분석", command=self.start_preview)
+        self.preview_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+
+        self.split_button = ttk.Button(btn_box, text="✂️ 분리 시작", command=self.start_split)
+        self.split_button.grid(row=0, column=1, sticky="ew", padx=4)
+
+        self.open_dir_button = ttk.Button(btn_box, text="📂 결과 폴더 열기", command=self.open_result_dir)
+        self.open_dir_button.grid(row=0, column=2, sticky="ew", padx=(4, 0))
+
+        preview_frame = ttk.LabelFrame(self.frame, text="분리 미리보기 목록", padding=10)
+        preview_frame.grid(row=2, column=0, padx=14, pady=(0, 8), sticky="nsew")
+        preview_frame.columnconfigure(0, weight=1)
+        preview_frame.rowconfigure(0, weight=1)
+
+        self.tree = ttk.Treeview(preview_frame, columns=("num", "pages", "filename"), show="headings", height=6)
+        self.tree.heading("num", text="순번")
+        self.tree.heading("pages", text="페이지 범위")
+        self.tree.heading("filename", text="생성될 파일명 (.hwp)")
+        self.tree.column("num", width=50, anchor="center")
+        self.tree.column("pages", width=120, anchor="center")
+        self.tree.column("filename", width=550, anchor="w")
+        self.tree.grid(row=0, column=0, sticky="nsew")
+
+        tree_scroll = ttk.Scrollbar(preview_frame, orient="vertical", command=self.tree.yview)
+        tree_scroll.grid(row=0, column=1, sticky="ns")
+        self.tree.configure(yscrollcommand=tree_scroll.set)
+
+        log_frame = ttk.LabelFrame(self.frame, text="진행 상황 / 로그", padding=12)
+        log_frame.grid(row=3, column=0, padx=14, pady=(0, 12), sticky="nsew")
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(2, weight=1)
+
+        status_row = ttk.Frame(log_frame)
+        status_row.grid(row=0, column=0, sticky="ew")
+        status_row.columnconfigure(1, weight=1)
+        ttk.Label(status_row, text="상태:").grid(row=0, column=0, sticky="w")
+        ttk.Label(status_row, textvariable=self.status_var).grid(row=0, column=1, sticky="w", padx=(6, 0))
+
+        self.progress_bar = ttk.Progressbar(log_frame, mode="determinate")
+        self.progress_bar.grid(row=1, column=0, sticky="ew", pady=(6, 6))
+
+        self.log_text = tk.Text(log_frame, height=5, state="disabled", wrap="word")
+        self.log_text.grid(row=2, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(log_frame, command=self.log_text.yview)
+        scrollbar.grid(row=2, column=1, sticky="ns")
+        self.log_text["yscrollcommand"] = scrollbar.set
+
+        self._on_mode_change()
+
+    def _on_mode_change(self):
+        mode = self.split_mode_var.get()
+        if mode in (SPLIT_MODE_N_PAGES, SPLIT_MODE_N_FILES):
+            self.n_label.grid()
+            self.n_spinbox.grid()
+            self.pat_label.grid_remove()
+            self.pat_entry.grid_remove()
+        else:
+            self.n_label.grid_remove()
+            self.n_spinbox.grid_remove()
+            self.pat_label.grid()
+            self.pat_entry.grid()
+
+    def select_input_file(self):
+        f = filedialog.askopenfilename(
+            title="분리할 HWP 파일 선택",
+            filetypes=[("HWP 파일", "*.hwp")],
         )
-        done_message = f"결과 파일이 생성되었습니다.\n\n{self.last_output_path}"
-        if not result.get("security_module_registered", True):
-            done_message += "\n\n보안 모듈 등록에 실패해 병합 중 한글 창 표시 모드로 전환되었습니다."
-        messagebox.showinfo("병합 완료", done_message)
-
-    def handle_error(self, message):
-        self.running = False
-        self.worker = None
-        self.set_controls_state(True)
-        self.status_var.set("오류로 중단됨")
-        self.append_log(f"[오류] {message}")
-        messagebox.showerror("병합 실패", message)
-
-    def open_output_folder(self):
-        if not self.last_output_path:
+        if not f:
             return
+        self.input_file_var.set(f)
+        if not self.output_dir_var.get().strip():
+            self.output_dir_var.set(str(Path(f).parent / (Path(f).stem + "_분리")))
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+    def select_output_dir(self):
+        d = filedialog.askdirectory(title="분리 파일을 저장할 폴더 선택")
+        if d:
+            self.output_dir_var.set(d)
+
+    def _append_log(self, message):
+        self.log_text.config(state="normal")
+        self.log_text.insert("end", message + "\n")
+        self.log_text.see("end")
+        self.log_text.config(state="disabled")
+
+    def _clear_log(self):
+        self.log_text.config(state="normal")
+        self.log_text.delete("1.0", "end")
+        self.log_text.config(state="disabled")
+
+    def _set_ui_running(self, running):
+        state = "disabled" if running else "normal"
+        self.split_button.config(state=state)
+        self.preview_button.config(state=state)
+        self.input_button.config(state=state)
+        self.output_dir_button.config(state=state)
+        self.running = running
+
+    def start_preview(self):
+        input_file = self.input_file_var.get().strip()
+        if not input_file:
+            messagebox.showwarning("경고", "입력 파일을 먼저 선택해 주세요.")
+            return
+
+        self._clear_log()
+        self._set_ui_running(True)
+        self.status_var.set("문서 분석 및 미리보기 추출 중…")
+        self.progress_bar["value"] = 0
+
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        mode = self.split_mode_var.get()
+        n = self.n_var.get()
+        pattern = self.pattern_var.get().strip() or "{name}"
+
+        t = threading.Thread(
+            target=self._preview_worker,
+            args=(input_file, mode, n, pattern),
+            daemon=True,
+        )
+        t.start()
+        self.frame.after(100, self._process_queue)
+
+    def _preview_worker(self, input_file, mode, n, pattern):
+        pythoncom.CoInitialize()
+        q = self.message_queue
+
+        def logger(msg):
+            q.put({"type": "log", "message": msg})
 
         try:
-            subprocess.Popen(["explorer", str(self.last_output_path.parent)])
-        except Exception as exc:
-            messagebox.showerror("폴더 열기 실패", str(exc))
+            input_path = Path(input_file)
+            import win32com.client, time as _t
+            hwp = win32com.client.gencache.EnsureDispatch("HWPFrame.HwpObject")
+            try:
+                hwp.RegisterModule("FilePathCheckDLL", "SecurityModule")
+            except Exception:
+                pass
+            
+            q.put({"type": "log", "message": f"HWP 파일 여는 중: {input_path.name}"})
+            hwp.Open(str(input_path), "HWP", "forceopen:true")
+            _t.sleep(0.5)
+            total_pages = hwp.PageCount
+            q.put({"type": "log", "message": f"총 페이지 수: {total_pages}"})
 
-    def on_close(self):
-        if self.running:
-            messagebox.showwarning(
-                "병합 진행 중",
-                "병합이 진행 중일 때는 창을 닫을 수 없습니다.\n완료 후 닫아 주세요.",
-            )
+            if mode == SPLIT_MODE_TABLE_NAME:
+                segment_starts, table_names = parse_items_from_hwp(hwp, logger=logger)
+                ranges = build_page_ranges_from_starts(segment_starts, total_pages)
+                
+                try:
+                    hwp.Quit()
+                except Exception:
+                    pass
+
+                min_len = min(len(ranges), len(table_names))
+                ranges = ranges[:min_len]
+                table_names = table_names[:min_len]
+
+                desc = f"표 탐색 모드: 총 {len(table_names)}개 유적 항목 감지"
+                q.put({"type": "preview_done", "ranges": ranges, "desc": desc, "names": table_names, "pattern": pattern})
+
+            elif mode == SPLIT_MODE_AUTO:
+                segment_starts, _ = detect_page_breaks_from_open_doc(hwp)
+                try:
+                    hwp.Quit()
+                except Exception:
+                    pass
+                ranges = build_page_ranges_from_starts(segment_starts, total_pages)
+                desc = f"페이지 나누기 자동 감지: {len(ranges)}개 세그먼트"
+                q.put({"type": "preview_done", "ranges": ranges, "desc": desc, "names": None, "pattern": pattern})
+
+            elif mode == SPLIT_MODE_N_PAGES:
+                try:
+                    hwp.Quit()
+                except Exception:
+                    pass
+                ranges = build_page_ranges_n_pages(total_pages, n)
+                desc = f"{n}페이지마다 분리: 총 {len(ranges)}개 파일"
+                q.put({"type": "preview_done", "ranges": ranges, "desc": desc, "names": None, "pattern": pattern})
+
+            else: # N_FILES
+                try:
+                    hwp.Quit()
+                except Exception:
+                    pass
+                ranges = build_page_ranges_n_files(total_pages, n)
+                desc = f"총 {n}개로 균등 분리: 총 {len(ranges)}개 파일"
+                q.put({"type": "preview_done", "ranges": ranges, "desc": desc, "names": None, "pattern": pattern})
+
+        except Exception as exc:
+            q.put({"type": "error", "message": str(exc)})
+        finally:
+            pythoncom.CoUninitialize()
+            q.put({"type": "done", "is_preview": True})
+
+    def start_split(self):
+        input_file = self.input_file_var.get().strip()
+        output_dir = self.output_dir_var.get().strip()
+
+        if not input_file:
+            messagebox.showwarning("경고", "입력 파일을 선택해 주세요.")
+            return
+        if not output_dir:
+            messagebox.showwarning("경고", "출력 폴더를 선택해 주세요.")
             return
 
+        if not self._preview_ranges or not self._preview_names:
+            messagebox.showinfo("안내", "먼저 [🔍 미리보기 / 표 분석]을 실행하여 분리 계획을 확인합니다.")
+            self.start_preview()
+            return
+
+        pattern = self.pattern_var.get().strip() or "{name}"
+
+        self._clear_log()
+        self._set_ui_running(True)
+        self.status_var.set("분리 작업 진행 중…")
+        self.progress_bar["value"] = 0
+
+        params = dict(
+            input_path=input_file,
+            output_dir=output_dir,
+            page_ranges=self._preview_ranges,
+            names=self._preview_names,
+            pattern=pattern,
+            visible=self.show_hwp_var.get(),
+        )
+        self.worker = threading.Thread(target=self._split_worker, kwargs=params, daemon=True)
+        self.worker.start()
+        self.frame.after(100, self._process_queue)
+
+    def _split_worker(self, input_path, output_dir, page_ranges, names, pattern, visible):
+        pythoncom.CoInitialize()
+        q = self.message_queue
+
+        def logger(msg):
+            q.put({"type": "log", "message": msg})
+
+        def progress_callback(payload):
+            q.put(payload)
+
+        try:
+            saved = execute_split_by_plan(
+                input_path=input_path,
+                output_dir=output_dir,
+                page_ranges=page_ranges,
+                names=names,
+                pattern=pattern,
+                visible=visible,
+                logger=logger,
+                progress_callback=progress_callback,
+            )
+            q.put({"type": "split_complete", "count": len(saved), "output_dir": output_dir})
+        except Exception as exc:
+            q.put({"type": "error", "message": str(exc)})
+        finally:
+            pythoncom.CoUninitialize()
+            q.put({"type": "done", "is_preview": False})
+
+    def _process_queue(self):
+        try:
+            while True:
+                msg = self.message_queue.get_nowait()
+                mtype = msg.get("type")
+
+                if mtype == "log":
+                    self._append_log(msg["message"])
+
+                elif mtype == "progress":
+                    total = msg.get("total", 0)
+                    current = msg.get("current", 0)
+                    if total:
+                        self.progress_bar["maximum"] = total
+                        self.progress_bar["value"] = current
+                    status = msg.get("status", "")
+                    if status:
+                        self.status_var.set(status)
+
+                elif mtype == "warning":
+                    self._append_log(f"[경고] {msg['message']}")
+
+                elif mtype == "error":
+                    self._append_log(f"[오류] {msg['message']}")
+                    messagebox.showerror("오류", msg["message"])
+                    self._set_ui_running(False)
+                    self.status_var.set("오류 발생")
+
+                elif mtype == "preview_done":
+                    ranges = msg["ranges"]
+                    desc = msg["desc"]
+                    names = msg.get("names")
+                    pattern = msg.get("pattern", "{name}")
+                    
+                    self._preview_ranges = ranges
+                    self._preview_names = names
+                    
+                    for item in self.tree.get_children():
+                        self.tree.delete(item)
+                        
+                    digits = len(str(len(ranges))) if ranges else 1
+                    stem = Path(self.input_file_var.get()).stem
+                    
+                    for idx, (s, e) in enumerate(ranges, start=1):
+                        num_str = str(idx).zfill(digits)
+                        if names and idx - 1 < len(names):
+                            raw_n = names[idx - 1]
+                            fname = pattern.replace("{name}", raw_n).replace("{num}", num_str) + ".hwp"
+                        else:
+                            fname = f"{stem}_{num_str}.hwp"
+                            
+                        self.tree.insert("", "end", values=(idx, f"p.{s} ~ p.{e}", fname))
+                        
+                    self.status_var.set(f"{desc} (총 {len(ranges)}개)")
+
+                elif mtype == "split_complete":
+                    count = msg["count"]
+                    out_dir = msg["output_dir"]
+                    self.status_var.set(f"분리 완료 ({count}개 파일)")
+                    if messagebox.askyesno("완료", f"분리가 완료되었습니다!\n총 {count}개 파일 → {out_dir}\n\n결과 폴더를 여시겠습니까?"):
+                        self.open_result_dir()
+
+                elif mtype == "done":
+                    self._set_ui_running(False)
+                    if self.status_var.get() not in ("오류 발생",) and not self.status_var.get().startswith("분리 완료"):
+                        self.status_var.set("대기 중")
+
+        except Exception:
+            pass
+        finally:
+            if self.running:
+                self.frame.after(100, self._process_queue)
+
+    def open_result_dir(self):
+        d = self.output_dir_var.get().strip()
+        if not d:
+            messagebox.showwarning("경고", "출력 폴더가 설정되지 않았습니다.")
+            return
+        subprocess.Popen(["explorer", d])
+
+    def on_close_check(self):
+        if self.running:
+            if not messagebox.askyesno("종료 확인", "분리가 진행 중입니다. 종료하시겠습니까?"):
+                return False
+        return True
+
+
+# ---------------------------------------------------------------------------
+# 앱 루트
+# ---------------------------------------------------------------------------
+
+class HwpMergerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("HWP 파일 병합/분리기")
+        self.root.geometry("880x740")
+        self.root.minsize(760, 620)
+
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.grid(row=0, column=0, sticky="nsew", padx=4, pady=4)
+
+        self.merge_tab = MergeTab(self.notebook)
+        self.split_tab = SplitTab(self.notebook)
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def on_close(self):
+        if not self.merge_tab.on_close_check():
+            return
+        if not self.split_tab.on_close_check():
+            return
         self.root.destroy()
 
 
 def main():
     root = Tk()
-    try:
-        style = ttk.Style()
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
-    except Exception:
-        pass
-
-    HwpMergerApp(root)
+    app = HwpMergerApp(root)
     root.mainloop()
 
 
