@@ -376,19 +376,52 @@ def _current_page_number(hwp):
     return int(indicator[3])
 
 
-def _table_control_positions(hwp):
-    """Return plain cursor positions for every table control in the source."""
+def _table_control_positions(hwp, keep_control=False):
+    """Return source-table positions, optionally retaining their HWP anchors.
+
+    Some HWP files have floating/legacy tables whose three-number cursor
+    position is not sufficient after switching away from and back to the
+    source tab.  The live control reference lets the saving phase ask HWP for
+    the original anchor again.  Legacy callers keep receiving plain tuples.
+    """
     positions = []
     ctrl = hwp.HeadCtrl
     while ctrl:
         if str(ctrl.CtrlID) == "tbl":
             try:
-                hwp.SetPosBySet(ctrl.GetAnchorPos(0))
-                positions.append(tuple(hwp.GetPos()))
+                anchor = ctrl.GetAnchorPos(0)
+                hwp.SetPosBySet(anchor)
+                position = tuple(hwp.GetPos())
+                if keep_control:
+                    positions.append({"position": position, "anchor": anchor})
+                else:
+                    positions.append(position)
             except Exception:
                 pass
         ctrl = ctrl.Next
     return positions
+
+
+def _select_table_control(hwp, table_position):
+    """Select a table, retrying with its original HWP control anchor."""
+    if isinstance(table_position, dict):
+        plain_position = table_position["position"]
+    else:
+        plain_position = table_position
+
+    hwp.SetPos(*plain_position)
+    found = hwp.FindCtrl()
+    if found == "tbl" or not isinstance(table_position, dict):
+        return found
+
+    # The ordinary position works for the document used during development.
+    # This fallback is only for documents whose table is stored as a floating
+    # or legacy object and needs the exact anchor supplied by HWP itself.
+    try:
+        hwp.SetPosBySet(table_position["anchor"])
+        return hwp.FindCtrl()
+    except Exception:
+        return found
 
 
 def _table_text_from_position(hwp, position):
@@ -1231,7 +1264,7 @@ def _table_groups_for_names(input_path, hwp, preview_names=None, logger=None):
     scanning or selecting the document body text.
     """
     rhwp_tables, records = analyze_items_with_rhwp(input_path, logger=logger)
-    table_positions = _table_control_positions(hwp)
+    table_positions = _table_control_positions(hwp, keep_control=True)
     if not table_positions:
         raise RuntimeError("한글에서 표 개체를 찾지 못했습니다.")
     if len(table_positions) != len(rhwp_tables):
@@ -1420,9 +1453,12 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
         emit_log(logger, f"  A3 바탕 탭에 표 {len(positions)}개를 넣는 중...")
         for number, position in enumerate(positions, start=1):
             source_document.SetActive_XHwpDocument()
-            source_hwp.SetPos(*position)
-            if source_hwp.FindCtrl() != "tbl":
-                raise RuntimeError(f"묶음의 {number}번째 표 개체를 선택하지 못했습니다.")
+            found_control = _select_table_control(source_hwp, position)
+            if found_control != "tbl":
+                raise RuntimeError(
+                    f"묶음의 {number}번째 표 개체를 선택하지 못했습니다 "
+                    f"(한글 응답: {found_control or '없음'})."
+                )
             source_hwp.HAction.Run("Copy")
             destination_document.SetActive_XHwpDocument()
             source_hwp.Run("MoveDocEnd")
