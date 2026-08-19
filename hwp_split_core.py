@@ -1708,7 +1708,11 @@ def _verify_saved_table_bundle(output_path, expected_name, expected_table_count)
         if record
     }
     if expected_name not in found_names:
-        raise RuntimeError(f"저장본에 '{expected_name}' 제목 표가 없습니다.")
+        detected = ", ".join(sorted(found_names)) or "없음"
+        raise RuntimeError(
+            f"저장본에 '{expected_name}' 제목 표가 없습니다. "
+            f"검출된 제목: {detected}."
+        )
     if len(tables) < expected_table_count:
         raise RuntimeError(
             f"저장본 표가 {len(tables)}개뿐입니다. "
