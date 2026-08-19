@@ -414,15 +414,16 @@ def _select_table_control(hwp, table_position):
     if found == "tbl" or not isinstance(table_position, dict):
         return found
 
-    # The ordinary position works for the document used during development.
-    # This fallback is only for documents whose table is stored as a floating
-    # or legacy object and needs the exact anchor supplied by HWP itself.
+    # The ordinary position works for inline tables.  A floating or legacy
+    # table needs the exact anchor supplied by HWP and then a direct control
+    # selection.  Do not call FindCtrl() between SetPosBySet() and
+    # SelectCtrlReverse(): that moves HWP away from the anchor in some files.
     try:
+        try:
+            hwp.Run("Cancel")
+        except Exception:
+            pass
         hwp.SetPosBySet(table_position["anchor"])
-        found = hwp.FindCtrl()
-        if found == "tbl":
-            return found
-
         # Some documents place the anchor immediately before a floating or
         # legacy table.  In that case FindCtrl() reports nothing, while HWP's
         # documented SelectCtrlReverse action selects the object behind the
