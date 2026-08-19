@@ -712,6 +712,25 @@ def _document_tab_snapshot(hwp):
     return ", ".join(parts)
 
 
+def _activate_document_by_id(hwp, document_id):
+    """Activate a live HWP document by ID instead of a stale tab reference.
+
+    HWP 2018 can leave an ``XHwpDocument`` reference pointing at a tab that
+    is no longer activated after ``FileNew``/``Open``.  Looking it up again in
+    ``XHwpDocuments`` is independent of table names and works for every tab.
+    """
+    document = hwp.XHwpDocuments.FindItem(document_id)
+    if document is None:
+        raise RuntimeError(f"문서 탭 ID {document_id}를 찾지 못했습니다.")
+    document.SetActive_XHwpDocument()
+    active_id = hwp.XHwpDocuments.Active_XHwpDocument.DocumentID
+    if str(active_id) != str(document_id):
+        raise RuntimeError(
+            f"문서 탭 ID {document_id} 활성화에 실패했습니다 (현재 탭 ID {active_id})."
+        )
+    return document
+
+
 def _append_table_selection_diagnostic(diagnostic_directory, lines):
     """Persist failure evidence outside the GUI log without saving document text."""
     diagnostic_path = diagnostic_directory / "hwp_table_selection_diagnostic.log"
@@ -1729,7 +1748,7 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
         # then load the real A3 template into that tab.  The source therefore
         # remains a separate document and the destination has an actual A3
         # section before any table is pasted.
-        source_document.SetActive_XHwpDocument()
+        _activate_document_by_id(source_hwp, source_document_id)
         a3_width, a3_height = _a3_template_dimensions()
         source_hwp.HAction.Run("FileNew")
         time.sleep(0.15)
@@ -1739,6 +1758,7 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
         source_hwp.Open(str(_a3_template_hwp_path()), "HWP", "forceopen:true")
         time.sleep(0.15)
         destination_document = source_hwp.XHwpDocuments.Active_XHwpDocument
+        destination_document_id = destination_document.DocumentID
         if destination_document.DocumentID == source_document_id:
             raise RuntimeError("A3 출력용 새 탭을 별도로 만들지 못했습니다.")
         a3_page_setup = _read_current_page_setup(source_hwp)
@@ -1754,7 +1774,7 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
         emit_log(logger, f"  A3 바탕 탭에 표 {len(positions)}개를 넣는 중...")
         for number, position in enumerate(positions, start=1):
             tab_before_activation = _document_tab_snapshot(source_hwp)
-            source_document.SetActive_XHwpDocument()
+            _activate_document_by_id(source_hwp, source_document_id)
             tab_after_activation = _document_tab_snapshot(source_hwp)
             found_control, selection_route, selection_trace = _select_table_control(source_hwp, position)
             # Keep successful bulk runs readable, but always show the first
@@ -1785,13 +1805,13 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
                     f"(시도: {selection_route}; 한글 응답: {found_control or '없음'})."
                 )
             source_hwp.HAction.Run("Copy")
-            destination_document.SetActive_XHwpDocument()
+            _activate_document_by_id(source_hwp, destination_document_id)
             source_hwp.Run("MoveDocEnd")
             if number > 1:
                 source_hwp.Run("BreakPara")
             source_hwp.HAction.Run("Paste")
 
-        destination_document.SetActive_XHwpDocument()
+        _activate_document_by_id(source_hwp, destination_document_id)
         applied_page_setup = _read_current_page_setup(source_hwp)
         if (
             abs(applied_page_setup["PaperWidth"] - a3_width) > 10
@@ -1823,7 +1843,7 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
             if destination_document is not None:
                 destination_document.Modified = False
                 destination_document.Close(False)
-            source_hwp.XHwpDocuments.FindItem(source_document_id).SetActive_XHwpDocument()
+            _activate_document_by_id(source_hwp, source_document_id)
         except Exception:
             pass
 
