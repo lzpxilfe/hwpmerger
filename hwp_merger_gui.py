@@ -18,7 +18,7 @@ from hwp_split_core import (
     SPLIT_MODE_N_PAGES,
     SPLIT_MODE_N_FILES,
     SPLIT_MODE_TABLE_NAME,
-    parse_items_from_hwp,
+    parse_items_from_rhwp,
     build_page_ranges_from_starts,
     build_page_ranges_n_pages,
     build_page_ranges_n_files,
@@ -509,12 +509,20 @@ class SplitTab:
     def _preview_worker(self, input_file, mode, n, pattern):
         pythoncom.CoInitialize()
         q = self.message_queue
+        q.put({"type": "log", "message": "[빌드] rhwp 표 구조 + 실제 A3 바탕 탭 검증 v23 (2026-08-19)"})
 
         def logger(msg):
             q.put({"type": "log", "message": msg})
 
         try:
             input_path = Path(input_file)
+            if mode == SPLIT_MODE_TABLE_NAME:
+                q.put({"type": "log", "message": f"rhwp 표 구조 분석 중: {input_path.name}"})
+                ranges, table_names = parse_items_from_rhwp(input_path, logger=logger)
+                desc = f"rhwp 표 구조 기준: 총 {len(table_names)}개 유적 항목 감지"
+                q.put({"type": "preview_done", "ranges": ranges, "desc": desc, "names": table_names, "pattern": pattern})
+                return
+
             import win32com.client, time as _t
             hwp = win32com.client.gencache.EnsureDispatch("HWPFrame.HwpObject")
             try:
@@ -528,23 +536,7 @@ class SplitTab:
             total_pages = hwp.PageCount
             q.put({"type": "log", "message": f"총 페이지 수: {total_pages}"})
 
-            if mode == SPLIT_MODE_TABLE_NAME:
-                segment_starts, table_names = parse_items_from_hwp(hwp, logger=logger)
-                ranges = build_page_ranges_from_starts(segment_starts, total_pages)
-                
-                try:
-                    hwp.Quit()
-                except Exception:
-                    pass
-
-                min_len = min(len(ranges), len(table_names))
-                ranges = ranges[:min_len]
-                table_names = table_names[:min_len]
-
-                desc = f"표 탐색 모드: 총 {len(table_names)}개 유적 항목 감지"
-                q.put({"type": "preview_done", "ranges": ranges, "desc": desc, "names": table_names, "pattern": pattern})
-
-            elif mode == SPLIT_MODE_AUTO:
+            if mode == SPLIT_MODE_AUTO:
                 segment_starts, _ = detect_page_breaks_from_open_doc(hwp)
                 try:
                     hwp.Quit()
@@ -608,12 +600,13 @@ class SplitTab:
             names=self._preview_names,
             pattern=pattern,
             visible=self.show_hwp_var.get(),
+            split_by_table=(self.split_mode_var.get() == SPLIT_MODE_TABLE_NAME),
         )
         self.worker = threading.Thread(target=self._split_worker, kwargs=params, daemon=True)
         self.worker.start()
         self.frame.after(100, self._process_queue)
 
-    def _split_worker(self, input_path, output_dir, page_ranges, names, pattern, visible):
+    def _split_worker(self, input_path, output_dir, page_ranges, names, pattern, visible, split_by_table):
         pythoncom.CoInitialize()
         q = self.message_queue
 
@@ -633,6 +626,7 @@ class SplitTab:
                 visible=visible,
                 logger=logger,
                 progress_callback=progress_callback,
+                split_by_table=split_by_table,
             )
             q.put({"type": "split_complete", "count": len(saved), "output_dir": output_dir})
         except Exception as exc:
@@ -692,7 +686,8 @@ class SplitTab:
                         else:
                             fname = f"{stem}_{num_str}.hwp"
                             
-                        self.tree.insert("", "end", values=(idx, f"p.{s} ~ p.{e}", fname))
+                        page_label = "표 단위" if (s, e) == (0, 0) else f"p.{s} ~ p.{e}"
+                        self.tree.insert("", "end", values=(idx, page_label, fname))
                         
                     self.status_var.set(f"{desc} (총 {len(ranges)}개)")
 
@@ -735,7 +730,7 @@ class SplitTab:
 class HwpMergerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("HWP 파일 병합/분리기")
+        self.root.title("HWP 파일 병합/분리기 - rhwp 표 구조 · 실제 A3 바탕 탭 v23")
         self.root.geometry("880x740")
         self.root.minsize(760, 620)
 

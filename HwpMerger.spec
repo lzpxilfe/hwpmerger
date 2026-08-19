@@ -5,7 +5,11 @@ a = Analysis(
     ['hwp_merger_gui.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[
+        ('resources\\a3_blank.hwp', 'resources'),
+        ('resources\\a3_blank.hwpx', 'resources'),
+        ('tools\\rhwp\\rhwp\\rhwp.exe', 'tools\\rhwp\\rhwp'),
+    ],
     hiddenimports=['pythoncom', 'pywintypes', 'win32com.client'],
     hookspath=[],
     hooksconfig={},

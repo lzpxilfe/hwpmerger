@@ -1,3 +1,4 @@
 __pycache__/
 *.pyc
 build/
+tools/rhwp/rhwp-v*-windows-x86_64.zip
