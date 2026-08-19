@@ -2,6 +2,7 @@ import os
 import re
 import time
 import ctypes
+import gc
 import os
 import json
 import subprocess
@@ -49,6 +50,25 @@ def emit_log(logger, message):
 
 class _ClipboardInterferenceError(RuntimeError):
     """Raised when another application changes HWP's copy payload mid-save."""
+
+
+class _HwpTabActivationError(RuntimeError):
+    """Raised when HWP 2018 has not released a temporary document tab yet."""
+
+
+def _is_hwp_memory_error(exc):
+    """Recognise HWP/COM resource exhaustion without depending on one locale."""
+    detail = f"{exc!s} {exc!r}".casefold()
+    return any(
+        marker in detail
+        for marker in (
+            "메모리 부족",
+            "메모리가 부족",
+            "out of memory",
+            "not enough memory",
+            "insufficient memory",
+        )
+    )
 
 
 def _clipboard_sequence_number():
@@ -764,7 +784,7 @@ def _activate_document_by_id(hwp, document_id):
         # tab manager is ready to activate another tab.  Reacquire the live
         # document object rather than reusing the previous COM reference.
         time.sleep(0.1)
-    raise RuntimeError(
+    raise _HwpTabActivationError(
         f"문서 탭 ID {document_id} 활성화에 실패했습니다 "
         f"(현재 탭 ID {last_active_id}, 열린 탭 수 {hwp.XHwpDocuments.Count})."
     )
@@ -2056,6 +2076,43 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
         )
         total = len(planned_names)
         output_plan = build_table_output_plan(planned_names, pattern)
+        newly_saved_since_restart = 0
+
+        def restart_source_hwp(reason):
+            """Recycle HWP's native image/document memory without losing work."""
+            nonlocal hwp, groups
+            emit_log(logger, f"[한글 작업 창 재시작] {reason}")
+            previous_hwp = hwp
+            try:
+                previous_hwp.Quit()
+            except Exception:
+                pass
+            hwp = None
+            del previous_hwp
+            gc.collect()
+            # HWP 2018 shuts down its document/image worker asynchronously.
+            # Give Windows a short window to release those native resources
+            # before starting the dedicated replacement process.
+            time.sleep(0.7)
+            hwp = get_hwp_application(
+                visible=True, logger=logger, progress_callback=progress_callback
+            )
+            emit_log(logger, "원본 HWP를 다시 여는 중...")
+            hwp.Open(str(input_path), "HWP", "forceopen:true")
+            reopened_names, reopened_groups = _table_groups_for_names(
+                input_path, hwp, preview_names=planned_names, logger=logger
+            )
+            if reopened_names != planned_names:
+                try:
+                    hwp.Quit()
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    "한글 작업 창을 다시 연 뒤 표 구조가 처음 분석 결과와 달라 "
+                    "안전하게 중단했습니다."
+                )
+            groups = reopened_groups
+
         if groups and groups[0]:
             # This non-destructive probe runs before an A3 tab exists.  The
             # same first table is traced again after the first tab switch, so
@@ -2123,6 +2180,19 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
                             logger=logger,
                         )
                         break
+                    except _HwpTabActivationError:
+                        # A tab activation failure is often the first visible
+                        # symptom of HWP 2018 exhausting native document/image
+                        # resources.  Do not keep retrying the same process:
+                        # restart it, reopen the unchanged source, then retry
+                        # the current group from its fresh control locators.
+                        if clipboard_attempt == 3:
+                            raise RuntimeError(
+                                "한글이 임시 A3 탭을 정리한 뒤에도 원본 탭으로 돌아가지 못했습니다. "
+                                "이 묶음은 저장하지 않았습니다."
+                            )
+                        restart_source_hwp("임시 A3 탭 전환 오류/한글 자원 부족 복구")
+                        positions = groups[group_index]
                     except _ClipboardInterferenceError:
                         if clipboard_attempt == 3:
                             raise RuntimeError(
@@ -2135,6 +2205,16 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
                             f"  [복구] 외부 클립보드 변경 감지 — 이 표 묶음을 다시 시도합니다 "
                             f"({clipboard_attempt}/3)...",
                         )
+                    except Exception as exc:
+                        if not _is_hwp_memory_error(exc):
+                            raise
+                        if clipboard_attempt == 3:
+                            raise RuntimeError(
+                                "한글이 메모리 부족을 반복 보고해 이 표 묶음을 저장하지 않았습니다. "
+                                "다른 한글 문서를 닫은 뒤 다시 실행해 주세요."
+                            ) from exc
+                        restart_source_hwp("한글 메모리 부족 복구")
+                        positions = groups[group_index]
             except RuntimeError as exc:
                 # Do not replace the normal rhwp/control-order workflow with
                 # title searches.  Recover only after the saved result proves
@@ -2170,6 +2250,15 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
                     logger=logger,
                 )
             saved.append(output_path)
+            newly_saved_since_restart += 1
+            # Photo-heavy A3 tables are handled by HWP's native process, not
+            # Python's heap.  Recycling that process in bounded batches keeps
+            # its unreleased image/document handles from accumulating through
+            # a 100+ record job.  Existing verified outputs are skipped and do
+            # not count toward this limit.
+            if newly_saved_since_restart >= 12:
+                restart_source_hwp("사진 표 12개 묶음 저장 후 메모리 정리")
+                newly_saved_since_restart = 0
         emit_progress(progress_callback, {"type": "progress", "current": total, "total": total, "status": "분리 완료"})
         return saved
     finally:
