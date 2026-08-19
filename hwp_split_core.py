@@ -1344,8 +1344,8 @@ def _repeat_find_from_caret(hwp, find_text):
     return bool(hwp.HAction.Execute("RepeatFind", pset.HSet))
 
 
-def _retry_title_table_locator(hwp, expected_name):
-    """Resolve one failed single-table record from its own title only.
+def _retry_title_table_locator(hwp, expected_name, near_position=None):
+    """Resolve a failed record's title table without scanning all body text.
 
     The normal splitter never walks the document text: rhwp supplies the table
     stream and HWP copies by control identity.  Some legacy documents expose a
@@ -1357,8 +1357,19 @@ def _retry_title_table_locator(hwp, expected_name):
     """
     parts = expected_name.split(" ", 1)
     site_name = parts[1] if len(parts) == 2 else expected_name
-    hwp.Run("MoveDocBegin")
-    if not _repeat_find_from_caret(hwp, site_name):
+    found = False
+    if near_position is not None:
+        try:
+            position = near_position.get("position") if isinstance(near_position, dict) else near_position
+            hwp.Run("Cancel")
+            hwp.SetPos(*position)
+            found = _repeat_find_from_caret(hwp, site_name)
+        except Exception:
+            found = False
+    if not found:
+        hwp.Run("MoveDocBegin")
+        found = _repeat_find_from_caret(hwp, site_name)
+    if not found:
         raise RuntimeError(f"검산 실패한 제목을 원본에서 다시 찾지 못했습니다: {site_name}")
     hwp.Run("Cancel")
     parent = hwp.ParentCtrl
@@ -1380,6 +1391,70 @@ def _retry_title_table_locator(hwp, expected_name):
         # fresh anchor route in _select_table_control remains available.
         "control_instance_id": None,
     }
+
+
+def _retry_table_group_from_title_bounds(
+    hwp,
+    expected_name,
+    next_expected_name,
+    expected_table_count,
+    near_position,
+):
+    """Rebuild one failed group from its real title-to-next-title boundary.
+
+    This is an exceptional recovery path, used only after rhwp proves that the
+    ordinal-selected result is missing its title.  It searches the failed
+    title and the immediately following title, then takes the intervening HWP
+    controls.  The count must still exactly match rhwp's planned group, so a
+    nested-table ambiguity cannot silently change a record's contents.
+    """
+    first = _retry_title_table_locator(hwp, expected_name, near_position)
+    next_locator = None
+    if next_expected_name:
+        next_parts = next_expected_name.split(" ", 1)
+        next_site_name = next_parts[1] if len(next_parts) == 2 else next_expected_name
+        hwp.Run("Cancel")
+        hwp.SetPos(*first["position"])
+        hwp.Run("MoveRight")
+        if not _repeat_find_from_caret(hwp, next_site_name):
+            raise RuntimeError(f"다음 제목을 원본에서 찾지 못했습니다: {next_site_name}")
+        hwp.Run("Cancel")
+        parent = hwp.ParentCtrl
+        if parent is None or str(getattr(parent, "CtrlID", "")) != "tbl":
+            raise RuntimeError(f"다음 제목의 표 개체를 찾지 못했습니다: {next_site_name}")
+        anchor = parent.GetAnchorPos(0)
+        next_locator = {
+            "anchor_position": (
+                int(anchor.Item("List")),
+                int(anchor.Item("Para")),
+                int(anchor.Item("Pos")),
+            ),
+        }
+
+    table_positions = _table_control_positions(hwp, keep_control=True)
+
+    def find_ordinal(locator, label):
+        matches = [
+            ordinal
+            for ordinal, candidate in enumerate(table_positions)
+            if candidate.get("anchor_position") == locator["anchor_position"]
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                f"{label} 제목 표의 한글 컨트롤 위치를 하나로 정할 수 없습니다 "
+                f"(후보 {len(matches)}개)."
+            )
+        return matches[0]
+
+    start = find_ordinal(first, "현재")
+    end = find_ordinal(next_locator, "다음") if next_locator else len(table_positions)
+    recovered = table_positions[start:end]
+    if not recovered or len(recovered) != expected_table_count:
+        raise RuntimeError(
+            f"제목 경계로 다시 찾은 표는 {len(recovered)}개이고 "
+            f"rhwp가 인식한 묶음은 {expected_table_count}개여서 저장하지 않았습니다."
+        )
+    return recovered
 
 
 def _logical_record_starts(hwp, names, logger=None):
@@ -2021,7 +2096,7 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
                 if candidate["base_key"] == item["base_key"]
             )
         }
-        for item, positions in zip(output_plan, groups):
+        for group_index, (item, positions) in enumerate(zip(output_plan, groups)):
             index = item["index"]
             name = item["name"]
             output_path = output_dir / item["filename"]
@@ -2062,23 +2137,33 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
                         )
             except RuntimeError as exc:
                 # Do not replace the normal rhwp/control-order workflow with
-                # title searches.  Recover only the exact one-table case where
-                # the saved result proves that the selected tbl was not its
-                # expected heading table.  Multi-table records remain fail
-                # closed: guessing their photo-table boundary would be worse
-                # than stopping with an error.
+                # title searches.  Recover only after the saved result proves
+                # that the selected tbl was not its expected heading table.
+                # The rebuilt HWP-control range must retain exactly the rhwp
+                # table count, so multi-table photo records remain fail-closed.
                 missing_title = "저장본에" in str(exc) and "제목 표가 없습니다" in str(exc)
-                if len(positions) != 1 or not missing_title:
+                if not missing_title:
                     raise
+                next_name = (
+                    output_plan[group_index + 1]["name"]
+                    if group_index + 1 < len(output_plan)
+                    else None
+                )
                 emit_log(
                     logger,
-                    "  [복구] 검산에 실패한 단일 표만 제목 표로 다시 확인합니다 "
+                    "  [복구] 검산에 실패한 표 묶음을 제목 표 경계로 다시 확인합니다 "
                     "(본문 전체를 읽지 않습니다)...",
                 )
-                corrected_position = _retry_title_table_locator(hwp, name)
+                corrected_positions = _retry_table_group_from_title_bounds(
+                    hwp,
+                    name,
+                    next_name,
+                    len(positions),
+                    positions[0],
+                )
                 _save_table_group_in_tab(
                     hwp,
-                    [corrected_position],
+                    corrected_positions,
                     output_path,
                     input_path.stat().st_size,
                     expected_name=name,
