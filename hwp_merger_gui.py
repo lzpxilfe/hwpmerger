@@ -19,6 +19,7 @@ from hwp_split_core import (
     SPLIT_MODE_N_FILES,
     SPLIT_MODE_TABLE_NAME,
     parse_items_from_rhwp,
+    build_table_output_plan,
     build_page_ranges_from_starts,
     build_page_ranges_n_pages,
     build_page_ranges_n_files,
@@ -509,7 +510,7 @@ class SplitTab:
     def _preview_worker(self, input_file, mode, n, pattern):
         pythoncom.CoInitialize()
         q = self.message_queue
-        q.put({"type": "log", "message": "[빌드] rhwp 표 구조 + 실제 A3 바탕 탭 검증 v23 (2026-08-19)"})
+        q.put({"type": "log", "message": "[빌드] rhwp 표 구조 + 실제 A3 바탕 탭 검증 v24 (2026-08-19)"})
 
         def logger(msg):
             q.put({"type": "log", "message": msg})
@@ -675,14 +676,14 @@ class SplitTab:
                     for item in self.tree.get_children():
                         self.tree.delete(item)
                         
+                    table_output_plan = build_table_output_plan(names, pattern) if names else []
                     digits = len(str(len(ranges))) if ranges else 1
                     stem = Path(self.input_file_var.get()).stem
                     
                     for idx, (s, e) in enumerate(ranges, start=1):
                         num_str = str(idx).zfill(digits)
-                        if names and idx - 1 < len(names):
-                            raw_n = names[idx - 1]
-                            fname = pattern.replace("{name}", raw_n).replace("{num}", num_str) + ".hwp"
+                        if table_output_plan and idx - 1 < len(table_output_plan):
+                            fname = table_output_plan[idx - 1]["filename"]
                         else:
                             fname = f"{stem}_{num_str}.hwp"
                             
@@ -730,7 +731,7 @@ class SplitTab:
 class HwpMergerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("HWP 파일 병합/분리기 - rhwp 표 구조 · 실제 A3 바탕 탭 v23")
+        self.root.title("HWP 파일 병합/분리기 - rhwp 표 구조 · 실제 A3 바탕 탭 v24")
         self.root.geometry("880x740")
         self.root.minsize(760, 620)
 

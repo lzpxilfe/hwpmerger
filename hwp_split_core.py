@@ -235,6 +235,46 @@ def _sanitize_filename(name):
     return name
 
 
+def build_table_output_plan(names, pattern="{name}"):
+    """Make deterministic, collision-free output names for recognised tables.
+
+    Identical drawing-code/site-name pairs can legitimately occur when a
+    cancelled record name is later reused.  The first keeps its ordinary name;
+    later occurrences receive `` (2)``, `` (3)``, and so on.
+    """
+    digits = len(str(len(names))) if names else 1
+    raw_stems = []
+    base_counts = {}
+    for index, name in enumerate(names, start=1):
+        stem = pattern.replace("{name}", name).replace("{num}", str(index).zfill(digits))
+        stem = _sanitize_filename(stem) or f"record-{index:0{digits}d}"
+        key = stem.casefold()
+        raw_stems.append((stem, key))
+        base_counts[key] = base_counts.get(key, 0) + 1
+
+    occurrences = {}
+    used_keys = set()
+    plan = []
+    for index, (name, (base_stem, base_key)) in enumerate(zip(names, raw_stems), start=1):
+        occurrence = occurrences.get(base_key, 0) + 1
+        occurrences[base_key] = occurrence
+        stem = base_stem if occurrence == 1 else f"{base_stem} ({occurrence})"
+        suffix = occurrence
+        while stem.casefold() in used_keys:
+            suffix += 1
+            stem = f"{base_stem} ({suffix})"
+        used_keys.add(stem.casefold())
+        plan.append({
+            "index": index,
+            "name": name,
+            "stem": stem,
+            "filename": f"{stem}.hwp",
+            "base_key": base_key,
+            "is_duplicate": base_counts[base_key] > 1,
+        })
+    return plan
+
+
 # ---------------------------------------------------------------------------
 # 유적 표 목록 분석
 # ---------------------------------------------------------------------------
@@ -1471,18 +1511,32 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
             input_path, hwp, preview_names=names, logger=logger
         )
         total = len(planned_names)
-        digits = len(str(total))
-        for index, (name, positions) in enumerate(zip(planned_names, groups), start=1):
-            stem = pattern.replace("{name}", name).replace("{num}", str(index).zfill(digits))
-            output_path = output_dir / f"{_sanitize_filename(stem)}.hwp"
+        output_plan = build_table_output_plan(planned_names, pattern)
+        duplicate_groups_missing_output = {
+            item["base_key"]
+            for item in output_plan
+            if item["is_duplicate"]
+            and not all(
+                (output_dir / candidate["filename"]).is_file()
+                for candidate in output_plan
+                if candidate["base_key"] == item["base_key"]
+            )
+        }
+        for item, positions in zip(output_plan, groups):
+            index = item["index"]
+            name = item["name"]
+            output_path = output_dir / item["filename"]
             emit_progress(progress_callback, {
                 "type": "progress", "current": index - 1, "total": total,
                 "status": f"표 묶음 저장 중 ({index}/{total}, 표 {len(positions)}개): {output_path.name}",
             })
-            if _has_valid_existing_table_bundle(output_path, name, len(positions)):
+            rebuild_duplicate_group = item["base_key"] in duplicate_groups_missing_output
+            if not rebuild_duplicate_group and _has_valid_existing_table_bundle(output_path, name, len(positions)):
                 emit_log(logger, f"  기존 검산 통과 파일 유지: {output_path.name}")
                 saved.append(output_path)
                 continue
+            if rebuild_duplicate_group:
+                emit_log(logger, f"  동명 유적 묶음 재생성: {output_path.name}")
             _save_table_group_in_tab(
                 hwp,
                 positions,
