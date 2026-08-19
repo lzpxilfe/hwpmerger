@@ -403,7 +403,7 @@ def _table_control_positions(hwp, keep_control=False):
 
 
 def _select_table_control(hwp, table_position):
-    """Select a table, retrying with its original HWP control anchor."""
+    """Select a table, retrying HWP's alternate control-selection route."""
     if isinstance(table_position, dict):
         plain_position = table_position["position"]
     else:
@@ -419,7 +419,18 @@ def _select_table_control(hwp, table_position):
     # or legacy object and needs the exact anchor supplied by HWP itself.
     try:
         hwp.SetPosBySet(table_position["anchor"])
-        return hwp.FindCtrl()
+        found = hwp.FindCtrl()
+        if found == "tbl":
+            return found
+
+        # Some documents place the anchor immediately before a floating or
+        # legacy table.  In that case FindCtrl() reports nothing, while HWP's
+        # documented SelectCtrlReverse action selects the object behind the
+        # anchor directly.
+        hwp.Run("SelectCtrlReverse")
+        selected = hwp.CurSelectedCtrl
+        selected_id = str(getattr(selected, "CtrlID", "")) if selected else ""
+        return selected_id or found
     except Exception:
         return found
 
