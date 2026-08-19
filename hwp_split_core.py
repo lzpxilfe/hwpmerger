@@ -385,9 +385,12 @@ def _table_control_positions(hwp, keep_control=False):
     the original anchor again.  Legacy callers keep receiving plain tuples.
     """
     positions = []
+    table_ordinal = 0
     ctrl = hwp.HeadCtrl
     while ctrl:
         if str(ctrl.CtrlID) == "tbl":
+            current_ordinal = table_ordinal
+            table_ordinal += 1
             try:
                 anchor = ctrl.GetAnchorPos(0)
                 anchor_position = (
@@ -407,6 +410,7 @@ def _table_control_positions(hwp, keep_control=False):
                         "anchor": anchor,
                         "anchor_position": anchor_position,
                         "control_instance_id": control_instance_id,
+                        "table_ordinal": current_ordinal,
                     })
                 else:
                     positions.append(position)
@@ -414,6 +418,44 @@ def _table_control_positions(hwp, keep_control=False):
                 pass
         ctrl = ctrl.Next
     return positions
+
+
+def _fresh_table_locator_at_ordinal(hwp, table_ordinal):
+    """Re-read one table's live HWP control after a document-tab switch.
+
+    ``HwpParameterSet`` anchor objects are COM objects.  On some older HWP
+    builds they are not dependable after activating a different document tab,
+    even though their numeric coordinates were valid before the switch.  This
+    obtains a fresh control by its physical HeadCtrl order; it never uses a
+    filename, title, or source-specific table count.
+    """
+    ctrl = hwp.HeadCtrl
+    current_ordinal = 0
+    while ctrl:
+        ctrl_id = str(getattr(ctrl, "CtrlID", ""))
+        if ctrl_id == "tbl":
+            if current_ordinal == table_ordinal:
+                anchor = ctrl.GetAnchorPos(0)
+                anchor_position = (
+                    int(anchor.Item("List")),
+                    int(anchor.Item("Para")),
+                    int(anchor.Item("Pos")),
+                )
+                try:
+                    control_instance_id = ctrl.GetCtrlInstID()
+                except Exception:
+                    control_instance_id = None
+                return {
+                    "anchor": anchor,
+                    "anchor_position": anchor_position,
+                    "control_instance_id": control_instance_id,
+                    "ctrl_id": ctrl_id,
+                    "user_desc": str(getattr(ctrl, "UserDesc", "")),
+                    "table_ordinal": current_ordinal,
+                }
+            current_ordinal += 1
+        ctrl = ctrl.Next
+    raise RuntimeError(f"원본 탭에서 표 순번 {table_ordinal + 1}을 다시 찾지 못했습니다.")
 
 
 def _selected_control_id(hwp):
@@ -425,6 +467,91 @@ def _selected_control_id(hwp):
         return ""
 
 
+def _selection_value(value):
+    """Compact, log-safe representation of a COM call result."""
+    if value is None:
+        return "없음"
+    text = repr(value)
+    return text if len(text) <= 180 else f"{text[:177]}..."
+
+
+def _selection_exception(exc):
+    details = [type(exc).__name__]
+    hresult = getattr(exc, "hresult", None)
+    if hresult is not None:
+        details.append(f"HRESULT={hresult!r}")
+    excepinfo = getattr(exc, "excepinfo", None)
+    if excepinfo:
+        details.append(f"excepinfo={_selection_value(excepinfo)}")
+    text = str(exc).replace("\r", " ").replace("\n", " ").strip()
+    if text:
+        details.append(text)
+    elif getattr(exc, "args", None):
+        details.append(f"args={_selection_value(exc.args)}")
+    result = "; ".join(details)
+    return result if len(result) <= 360 else f"{result[:357]}..."
+
+
+def _selection_snapshot(hwp, include_selected_range=False):
+    """Read-only state useful when HWP declines to select a control."""
+    parts = []
+    try:
+        parts.append(f"현재 위치={tuple(hwp.GetPos())}")
+    except Exception as exc:
+        parts.append(f"현재 위치 읽기 실패={_selection_exception(exc)}")
+    try:
+        selected = hwp.CurSelectedCtrl
+        if selected:
+            ctrl_id = str(getattr(selected, "CtrlID", "")) or "?"
+            try:
+                instance_id = selected.GetCtrlInstID()
+                parts.append(f"선택 컨트롤={ctrl_id}#{_selection_value(instance_id)}")
+            except Exception:
+                parts.append(f"선택 컨트롤={ctrl_id}")
+            try:
+                parent = selected.ParentCtrl
+                parent_id = str(getattr(parent, "CtrlID", "")) if parent else "없음"
+                parts.append(f"상위 컨트롤={parent_id or '?'}")
+            except Exception as exc:
+                parts.append(f"상위 컨트롤 읽기 실패={_selection_exception(exc)}")
+        else:
+            parts.append("선택 컨트롤=없음")
+    except Exception as exc:
+        parts.append(f"선택 컨트롤 읽기 실패={_selection_exception(exc)}")
+    if include_selected_range:
+        try:
+            selected_range = hwp.GetSelectedPos()
+            parts.append(f"선택 범위={_selection_value(selected_range)}")
+        except Exception as exc:
+            parts.append(f"선택 범위 읽기 실패={_selection_exception(exc)}")
+    try:
+        parts.append(f"상태={_selection_value(hwp.KeyIndicator())}")
+    except Exception as exc:
+        parts.append(f"상태 읽기 실패={_selection_exception(exc)}")
+    return ", ".join(parts)
+
+
+def _trace_hwp_call(hwp, trace, label, operation, include_selected_range=False):
+    """Record both sides of one stateful HWP COM call without hiding errors."""
+    trace.append(f"{label} 호출 전: {_selection_snapshot(hwp, include_selected_range)}")
+    started = time.perf_counter()
+    try:
+        result = operation()
+    except Exception as exc:
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        trace.append(
+            f"{label} 예외 ({elapsed_ms:.0f} ms): {_selection_exception(exc)}; "
+            f"호출 후: {_selection_snapshot(hwp, include_selected_range)}"
+        )
+        return False, None
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    trace.append(
+        f"{label} 반환={_selection_value(result)} ({elapsed_ms:.0f} ms): "
+        f"호출 후: {_selection_snapshot(hwp, include_selected_range)}"
+    )
+    return True, result
+
+
 def _select_table_control(hwp, table_position):
     """Select one exact table through progressively more direct HWP routes.
 
@@ -433,62 +560,169 @@ def _select_table_control(hwp, table_position):
     file-specific table number.  Older HWP builds may not support direct
     instance selection, in which case the documented anchor route is used.
     """
+    trace = []
+
+    def record(message):
+        trace.append(message)
+
     if isinstance(table_position, dict):
         plain_position = table_position["position"]
     else:
         plain_position = table_position
 
-    hwp.SetPos(*plain_position)
-    found = hwp.FindCtrl()
+    if isinstance(table_position, dict):
+        record(
+            "대상 식별자: "
+            f"커서={_selection_value(plain_position)}, "
+            f"앵커={_selection_value(table_position.get('anchor_position'))}, "
+            f"컨트롤ID={_selection_value(table_position.get('control_instance_id'))}"
+        )
+    found = None
+    positioned, _ = _trace_hwp_call(
+        hwp, trace, f"일반 위치 SetPos{plain_position!r}",
+        lambda: hwp.SetPos(*plain_position),
+    )
+    if positioned:
+        found_ok, found = _trace_hwp_call(
+            hwp, trace, "일반 위치 FindCtrl", hwp.FindCtrl, include_selected_range=True,
+        )
+        if not found_ok:
+            found = None
     if found == "tbl" or not isinstance(table_position, dict):
-        return found, "일반 위치"
+        return found, "일반 위치", trace
 
+    # After switching tabs, retrieve the same physical HeadCtrl ordinal again
+    # rather than trusting the pre-switch COM anchor object.
+    fresh_locator = None
+    table_ordinal = table_position.get("table_ordinal")
+    if table_ordinal is not None:
+        fresh_ok, fresh_locator = _trace_hwp_call(
+            hwp, trace, f"새 HeadCtrl 표 재조회(순번 {table_ordinal + 1})",
+            lambda: _fresh_table_locator_at_ordinal(hwp, table_ordinal),
+        )
+        if fresh_ok and fresh_locator:
+            record(
+                "새 HeadCtrl 정보: "
+                f"CtrlID={fresh_locator['ctrl_id']}, UserDesc={fresh_locator['user_desc']!r}, "
+                f"앵커={fresh_locator['anchor_position']!r}, "
+                f"컨트롤ID={_selection_value(fresh_locator['control_instance_id'])}"
+            )
+            _trace_hwp_call(hwp, trace, "새 앵커 Cancel", lambda: hwp.Run("Cancel"))
+            anchored, _ = _trace_hwp_call(
+                hwp, trace, "새 앵커 SetPosBySet",
+                lambda: hwp.SetPosBySet(fresh_locator["anchor"]),
+            )
+            if anchored:
+                fresh_found_ok, fresh_found = _trace_hwp_call(
+                    hwp, trace, "새 앵커 FindCtrl", hwp.FindCtrl, include_selected_range=True,
+                )
+                if fresh_found_ok:
+                    found = fresh_found
+                    if found == "tbl":
+                        return found, "새 HeadCtrl 앵커 + FindCtrl", trace
+
+            # HWP 2018-compatible fallbacks from the freshly re-read anchor.
+            _trace_hwp_call(hwp, trace, "새 앵커 Front Cancel", lambda: hwp.Run("Cancel"))
+            front_positioned, _ = _trace_hwp_call(
+                hwp, trace, "새 앵커 Front SetPosBySet",
+                lambda: hwp.SetPosBySet(fresh_locator["anchor"]),
+            )
+            if front_positioned:
+                _trace_hwp_call(
+                    hwp, trace, "새 앵커 SelectCtrlFront",
+                    lambda: hwp.Run("SelectCtrlFront"), include_selected_range=True,
+                )
+                if _selected_control_id(hwp) == "tbl":
+                    return "tbl", "새 HeadCtrl 앵커 + SelectCtrlFront", trace
+
+            _trace_hwp_call(hwp, trace, "새 앵커 Reverse Cancel", lambda: hwp.Run("Cancel"))
+            reverse_positioned, _ = _trace_hwp_call(
+                hwp, trace, "새 앵커 Reverse SetPosBySet",
+                lambda: hwp.SetPosBySet(fresh_locator["anchor"]),
+            )
+            if reverse_positioned:
+                _trace_hwp_call(
+                    hwp, trace, "새 앵커 SelectCtrlReverse",
+                    lambda: hwp.Run("SelectCtrlReverse"), include_selected_range=True,
+                )
+                if _selected_control_id(hwp) == "tbl":
+                    return "tbl", "새 HeadCtrl 앵커 + SelectCtrlReverse", trace
+    else:
+        record("새 HeadCtrl 표 재조회: 표 순번이 없어 건너뜀")
+
+    # Newer HWP versions expose a direct control-instance selector.  It is
+    # intentionally optional because older installations do not implement it.
     control_instance_id = table_position.get("control_instance_id")
     if control_instance_id is not None:
-        try:
-            hwp.Run("Cancel")
-            hwp.SelectCtrl(control_instance_id, 1)
-            selected_id = _selected_control_id(hwp)
-            if selected_id == "tbl":
-                return selected_id, "표 컨트롤 ID"
-        except Exception:
-            pass
+        _trace_hwp_call(hwp, trace, "표 컨트롤 ID Cancel", lambda: hwp.Run("Cancel"))
+        _trace_hwp_call(
+            hwp, trace, f"표 컨트롤 ID SelectCtrl({control_instance_id!r}, 1)",
+            lambda: hwp.SelectCtrl(control_instance_id, 1), include_selected_range=True,
+        )
+        if _selected_control_id(hwp) == "tbl":
+            return "tbl", "표 컨트롤 ID", trace
+    else:
+        record("표 컨트롤 ID: 이 한글 버전에서 읽을 수 없어 건너뜀")
 
-    # The published HWP table route is: the anchor's List/Para/Pos triple,
-    # then SelectCtrlReverse.  This differs from the cursor position captured
-    # above, which may be just outside a floating or legacy table.
+    # Retain the pre-switch numeric and COM anchor fallbacks for documents
+    # whose HeadCtrl order cannot be re-read after a tab change.
     anchor_position = table_position.get("anchor_position")
     if anchor_position:
-        try:
-            hwp.Run("Cancel")
-            hwp.SetPos(*anchor_position)
-            hwp.Run("SelectCtrlReverse")
-            selected_id = _selected_control_id(hwp)
-            if selected_id == "tbl":
-                return selected_id, "표 앵커 좌표"
-        except Exception:
-            pass
+        _trace_hwp_call(hwp, trace, "기존 앵커 좌표 Cancel", lambda: hwp.Run("Cancel"))
+        old_positioned, _ = _trace_hwp_call(
+            hwp, trace, f"기존 앵커 좌표 SetPos{anchor_position!r}",
+            lambda: hwp.SetPos(*anchor_position),
+        )
+        if old_positioned:
+            _trace_hwp_call(
+                hwp, trace, "기존 앵커 좌표 SelectCtrlReverse",
+                lambda: hwp.Run("SelectCtrlReverse"), include_selected_range=True,
+            )
+            if _selected_control_id(hwp) == "tbl":
+                return "tbl", "기존 앵커 좌표", trace
+    else:
+        record("기존 앵커 좌표: 읽을 수 없어 건너뜀")
 
-    # Keep the SetPosBySet variant for HWP builds that represent the anchor
-    # with extra state beyond List/Para/Pos.  No lookup is allowed between
-    # setting this anchor and selecting its preceding control.
+    _trace_hwp_call(hwp, trace, "기존 앵커 객체 Cancel", lambda: hwp.Run("Cancel"))
+    old_anchor_positioned, _ = _trace_hwp_call(
+        hwp, trace, "기존 앵커 객체 SetPosBySet",
+        lambda: hwp.SetPosBySet(table_position["anchor"]),
+    )
+    if old_anchor_positioned:
+        _trace_hwp_call(
+            hwp, trace, "기존 앵커 객체 SelectCtrlReverse",
+            lambda: hwp.Run("SelectCtrlReverse"), include_selected_range=True,
+        )
+        if _selected_control_id(hwp) == "tbl":
+            return "tbl", "기존 앵커 객체", trace
+    return found, "일반 위치 · 표 컨트롤 ID · 표 앵커 좌표 · 표 앵커 객체", trace
+
+
+def _document_tab_snapshot(hwp):
+    """Return only document-tab metadata; it never reads document contents."""
+    parts = []
     try:
-        try:
-            hwp.Run("Cancel")
-        except Exception:
-            pass
-        hwp.SetPosBySet(table_position["anchor"])
-        # Some documents place the anchor immediately before a floating or
-        # legacy table.  In that case FindCtrl() reports nothing, while HWP's
-        # documented SelectCtrlReverse action selects the object behind the
-        # anchor directly.
-        hwp.Run("SelectCtrlReverse")
-        selected_id = _selected_control_id(hwp)
-        if selected_id == "tbl":
-            return selected_id, "표 앵커 객체"
-    except Exception:
-        pass
-    return found, "일반 위치 · 표 컨트롤 ID · 표 앵커 좌표 · 표 앵커 객체"
+        parts.append(f"현재 탭 ID={hwp.XHwpDocuments.Active_XHwpDocument.DocumentID}")
+    except Exception as exc:
+        parts.append(f"현재 탭 ID 읽기 실패={_selection_exception(exc)}")
+    try:
+        parts.append(f"열린 탭 수={hwp.XHwpDocuments.Count}")
+    except Exception as exc:
+        parts.append(f"열린 탭 수 읽기 실패={_selection_exception(exc)}")
+    return ", ".join(parts)
+
+
+def _append_table_selection_diagnostic(diagnostic_directory, lines):
+    """Persist failure evidence outside the GUI log without saving document text."""
+    diagnostic_path = diagnostic_directory / "hwp_table_selection_diagnostic.log"
+    try:
+        with diagnostic_path.open("a", encoding="utf-8") as stream:
+            stream.write("\n[표 선택 진단]\n")
+            stream.write("\n".join(lines))
+            stream.write("\n")
+    except OSError:
+        return None
+    return diagnostic_path
 
 
 def _table_text_from_position(hwp, position):
@@ -1519,9 +1753,33 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
 
         emit_log(logger, f"  A3 바탕 탭에 표 {len(positions)}개를 넣는 중...")
         for number, position in enumerate(positions, start=1):
+            tab_before_activation = _document_tab_snapshot(source_hwp)
             source_document.SetActive_XHwpDocument()
-            found_control, selection_route = _select_table_control(source_hwp, position)
+            tab_after_activation = _document_tab_snapshot(source_hwp)
+            found_control, selection_route, selection_trace = _select_table_control(source_hwp, position)
+            # Keep successful bulk runs readable, but always show the first
+            # table's route and every failed route.  The first table is also
+            # the fastest way to diagnose documents whose controls cannot be
+            # selected at all.
+            if number == 1 or found_control != "tbl":
+                emit_log(
+                    logger,
+                    f"  [표 선택 진단] 요청 원본 탭 ID={source_document_id}, 표 순번={number}",
+                )
+                emit_log(logger, f"  [표 선택 진단] 탭 전환 전: {tab_before_activation}")
+                emit_log(logger, f"  [표 선택 진단] 탭 전환 후: {tab_after_activation}")
+                for line in selection_trace:
+                    emit_log(logger, f"  [표 선택 진단] {line}")
             if found_control != "tbl":
+                diagnostic_lines = [
+                    f"요청 원본 탭 ID={source_document_id}, 표 순번={number}",
+                    f"탭 전환 전: {tab_before_activation}",
+                    f"탭 전환 후: {tab_after_activation}",
+                    *selection_trace,
+                ]
+                diagnostic_path = _append_table_selection_diagnostic(output_path.parent, diagnostic_lines)
+                if diagnostic_path is not None:
+                    emit_log(logger, f"  [표 선택 진단] 상세 로그 파일: {diagnostic_path}")
                 raise RuntimeError(
                     f"묶음의 {number}번째 표 개체를 선택하지 못했습니다 "
                     f"(시도: {selection_route}; 한글 응답: {found_control or '없음'})."
@@ -1615,6 +1873,36 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
         )
         total = len(planned_names)
         output_plan = build_table_output_plan(planned_names, pattern)
+        if groups and groups[0]:
+            # This non-destructive probe runs before an A3 tab exists.  The
+            # same first table is traced again after the first tab switch, so
+            # the log can distinguish an inherently unselectable document
+            # from a tab-switch/COM-reference problem.
+            emit_log(logger, "[표 선택 진단] A3 탭 생성 전 원본 첫 표 사전 확인")
+            emit_log(logger, f"[표 선택 진단] {_document_tab_snapshot(hwp)}")
+            probe_control, probe_route, probe_trace = _select_table_control(hwp, groups[0][0])
+            for line in probe_trace:
+                emit_log(logger, f"[표 선택 진단] {line}")
+            emit_log(
+                logger,
+                f"[표 선택 진단] 사전 확인 결과: {probe_route}, "
+                f"한글 응답={probe_control or '없음'}",
+            )
+            if probe_control != "tbl":
+                diagnostic_path = _append_table_selection_diagnostic(
+                    output_dir,
+                    [
+                        "A3 탭 생성 전 원본 첫 표 사전 확인",
+                        _document_tab_snapshot(hwp),
+                        *probe_trace,
+                    ],
+                )
+                if diagnostic_path is not None:
+                    emit_log(logger, f"[표 선택 진단] 사전 확인 로그 파일: {diagnostic_path}")
+            try:
+                hwp.Run("Cancel")
+            except Exception:
+                pass
         duplicate_groups_missing_output = {
             item["base_key"]
             for item in output_plan
