@@ -1,6 +1,7 @@
 import os
 import re
 import time
+import ctypes
 import os
 import json
 import subprocess
@@ -44,6 +45,36 @@ def emit_log(logger, message):
         logger(message)
     else:
         print(message)
+
+
+class _ClipboardInterferenceError(RuntimeError):
+    """Raised when another application changes HWP's copy payload mid-save."""
+
+
+def _clipboard_sequence_number():
+    """Return Windows' clipboard change counter, or None if it is unavailable.
+
+    HWP's table Copy/Paste actions use the shared Windows clipboard.  The
+    counter lets us reject a paste when a user (or another program) copied
+    something in the short interval between those two actions.  No clipboard
+    contents are read or changed here.
+    """
+    try:
+        value = ctypes.windll.user32.GetClipboardSequenceNumber()
+        return int(value) if value else None
+    except Exception:
+        return None
+
+
+def _raise_if_clipboard_changed(copy_sequence):
+    if copy_sequence is None:
+        return
+    current_sequence = _clipboard_sequence_number()
+    if current_sequence is not None and current_sequence != copy_sequence:
+        raise _ClipboardInterferenceError(
+            "표를 복사한 뒤 다른 프로그램이 클립보드를 변경했습니다. "
+            "이 묶음은 저장하지 않고 다시 시도합니다."
+        )
 
 
 def _bundled_file(relative_path):
@@ -1855,7 +1886,14 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
                     f"(시도: {selection_route}; 한글 응답: {found_control or '없음'})."
                 )
             source_hwp.HAction.Run("Copy")
+            # Copy/Paste is an unavoidable HWP 2018 clipboard handoff.  Take
+            # the sequence after HWP has populated it, then reject a paste if
+            # another application copied something while the destination tab
+            # was being activated.
+            time.sleep(0.03)
+            copy_sequence = _clipboard_sequence_number()
             _activate_document_by_id(source_hwp, destination_document_id)
+            _raise_if_clipboard_changed(copy_sequence)
             source_hwp.Run("MoveDocEnd")
             if number > 1:
                 source_hwp.Run("BreakPara")
@@ -1999,14 +2037,29 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
             if rebuild_duplicate_group:
                 emit_log(logger, f"  동명 유적 묶음 재생성: {output_path.name}")
             try:
-                _save_table_group_in_tab(
-                    hwp,
-                    positions,
-                    output_path,
-                    input_path.stat().st_size,
-                    expected_name=name,
-                    logger=logger,
-                )
+                for clipboard_attempt in range(1, 4):
+                    try:
+                        _save_table_group_in_tab(
+                            hwp,
+                            positions,
+                            output_path,
+                            input_path.stat().st_size,
+                            expected_name=name,
+                            logger=logger,
+                        )
+                        break
+                    except _ClipboardInterferenceError:
+                        if clipboard_attempt == 3:
+                            raise RuntimeError(
+                                "작업 중 다른 프로그램의 복사/붙여넣기가 반복 감지되어 "
+                                "이 표 묶음을 안전하게 저장하지 않았습니다. "
+                                "잠시 클립보드를 사용하지 않은 뒤 다시 실행해 주세요."
+                            )
+                        emit_log(
+                            logger,
+                            f"  [복구] 외부 클립보드 변경 감지 — 이 표 묶음을 다시 시도합니다 "
+                            f"({clipboard_attempt}/3)...",
+                        )
             except RuntimeError as exc:
                 # Do not replace the normal rhwp/control-order workflow with
                 # title searches.  Recover only the exact one-table case where
