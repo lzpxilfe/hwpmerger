@@ -390,10 +390,24 @@ def _table_control_positions(hwp, keep_control=False):
         if str(ctrl.CtrlID) == "tbl":
             try:
                 anchor = ctrl.GetAnchorPos(0)
+                anchor_position = (
+                    int(anchor.Item("List")),
+                    int(anchor.Item("Para")),
+                    int(anchor.Item("Pos")),
+                )
+                try:
+                    control_instance_id = ctrl.GetCtrlInstID()
+                except Exception:
+                    control_instance_id = None
                 hwp.SetPosBySet(anchor)
                 position = tuple(hwp.GetPos())
                 if keep_control:
-                    positions.append({"position": position, "anchor": anchor})
+                    positions.append({
+                        "position": position,
+                        "anchor": anchor,
+                        "anchor_position": anchor_position,
+                        "control_instance_id": control_instance_id,
+                    })
                 else:
                     positions.append(position)
             except Exception:
@@ -402,8 +416,23 @@ def _table_control_positions(hwp, keep_control=False):
     return positions
 
 
+def _selected_control_id(hwp):
+    """Return the ID of the object selected by HWP, if one is selected."""
+    try:
+        selected = hwp.CurSelectedCtrl
+        return str(getattr(selected, "CtrlID", "")) if selected else ""
+    except Exception:
+        return ""
+
+
 def _select_table_control(hwp, table_position):
-    """Select a table, retrying HWP's alternate control-selection route."""
+    """Select one exact table through progressively more direct HWP routes.
+
+    Table controls are collected from HeadCtrl, so their control-instance ID
+    and their three-part anchor are document identities, not table text or a
+    file-specific table number.  Older HWP builds may not support direct
+    instance selection, in which case the documented anchor route is used.
+    """
     if isinstance(table_position, dict):
         plain_position = table_position["position"]
     else:
@@ -412,12 +441,37 @@ def _select_table_control(hwp, table_position):
     hwp.SetPos(*plain_position)
     found = hwp.FindCtrl()
     if found == "tbl" or not isinstance(table_position, dict):
-        return found
+        return found, "일반 위치"
 
-    # The ordinary position works for inline tables.  A floating or legacy
-    # table needs the exact anchor supplied by HWP and then a direct control
-    # selection.  Do not call FindCtrl() between SetPosBySet() and
-    # SelectCtrlReverse(): that moves HWP away from the anchor in some files.
+    control_instance_id = table_position.get("control_instance_id")
+    if control_instance_id is not None:
+        try:
+            hwp.Run("Cancel")
+            hwp.SelectCtrl(control_instance_id, 1)
+            selected_id = _selected_control_id(hwp)
+            if selected_id == "tbl":
+                return selected_id, "표 컨트롤 ID"
+        except Exception:
+            pass
+
+    # The published HWP table route is: the anchor's List/Para/Pos triple,
+    # then SelectCtrlReverse.  This differs from the cursor position captured
+    # above, which may be just outside a floating or legacy table.
+    anchor_position = table_position.get("anchor_position")
+    if anchor_position:
+        try:
+            hwp.Run("Cancel")
+            hwp.SetPos(*anchor_position)
+            hwp.Run("SelectCtrlReverse")
+            selected_id = _selected_control_id(hwp)
+            if selected_id == "tbl":
+                return selected_id, "표 앵커 좌표"
+        except Exception:
+            pass
+
+    # Keep the SetPosBySet variant for HWP builds that represent the anchor
+    # with extra state beyond List/Para/Pos.  No lookup is allowed between
+    # setting this anchor and selecting its preceding control.
     try:
         try:
             hwp.Run("Cancel")
@@ -429,11 +483,12 @@ def _select_table_control(hwp, table_position):
         # documented SelectCtrlReverse action selects the object behind the
         # anchor directly.
         hwp.Run("SelectCtrlReverse")
-        selected = hwp.CurSelectedCtrl
-        selected_id = str(getattr(selected, "CtrlID", "")) if selected else ""
-        return selected_id or found
+        selected_id = _selected_control_id(hwp)
+        if selected_id == "tbl":
+            return selected_id, "표 앵커 객체"
     except Exception:
-        return found
+        pass
+    return found, "일반 위치 · 표 컨트롤 ID · 표 앵커 좌표 · 표 앵커 객체"
 
 
 def _table_text_from_position(hwp, position):
@@ -1465,11 +1520,11 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
         emit_log(logger, f"  A3 바탕 탭에 표 {len(positions)}개를 넣는 중...")
         for number, position in enumerate(positions, start=1):
             source_document.SetActive_XHwpDocument()
-            found_control = _select_table_control(source_hwp, position)
+            found_control, selection_route = _select_table_control(source_hwp, position)
             if found_control != "tbl":
                 raise RuntimeError(
                     f"묶음의 {number}번째 표 개체를 선택하지 못했습니다 "
-                    f"(한글 응답: {found_control or '없음'})."
+                    f"(시도: {selection_route}; 한글 응답: {found_control or '없음'})."
                 )
             source_hwp.HAction.Run("Copy")
             destination_document.SetActive_XHwpDocument()
