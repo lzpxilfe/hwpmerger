@@ -67,6 +67,11 @@ def _is_hwp_memory_error(exc):
             "out of memory",
             "not enough memory",
             "insufficient memory",
+            # HWP 2018 often shows a Korean out-of-memory dialog first, then
+            # merely reports that FileNew failed to create a separate tab.
+            # Treat that aftermath as recyclable native-resource pressure too.
+            "a3 출력용 새 탭을 만들지 못했습니다",
+            "a3 출력용 새 탭을 별도로 만들지 못했습니다",
         )
     )
 
