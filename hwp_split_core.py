@@ -719,16 +719,24 @@ def _activate_document_by_id(hwp, document_id):
     is no longer activated after ``FileNew``/``Open``.  Looking it up again in
     ``XHwpDocuments`` is independent of table names and works for every tab.
     """
-    document = hwp.XHwpDocuments.FindItem(document_id)
-    if document is None:
-        raise RuntimeError(f"문서 탭 ID {document_id}를 찾지 못했습니다.")
-    document.SetActive_XHwpDocument()
-    active_id = hwp.XHwpDocuments.Active_XHwpDocument.DocumentID
-    if str(active_id) != str(document_id):
-        raise RuntimeError(
-            f"문서 탭 ID {document_id} 활성화에 실패했습니다 (현재 탭 ID {active_id})."
-        )
-    return document
+    last_active_id = None
+    for attempt in range(15):
+        document = hwp.XHwpDocuments.FindItem(document_id)
+        if document is None:
+            raise RuntimeError(f"문서 탭 ID {document_id}를 찾지 못했습니다.")
+        document.SetActive_XHwpDocument()
+        active_id = hwp.XHwpDocuments.Active_XHwpDocument.DocumentID
+        if str(active_id) == str(document_id):
+            return document
+        last_active_id = active_id
+        # HWP 2018 sometimes acknowledges Open/FileNew before its document
+        # tab manager is ready to activate another tab.  Reacquire the live
+        # document object rather than reusing the previous COM reference.
+        time.sleep(0.1)
+    raise RuntimeError(
+        f"문서 탭 ID {document_id} 활성화에 실패했습니다 "
+        f"(현재 탭 ID {last_active_id}, 열린 탭 수 {hwp.XHwpDocuments.Count})."
+    )
 
 
 def _append_table_selection_diagnostic(diagnostic_directory, lines):
