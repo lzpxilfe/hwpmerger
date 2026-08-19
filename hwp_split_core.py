@@ -1313,6 +1313,44 @@ def _repeat_find_from_caret(hwp, find_text):
     return bool(hwp.HAction.Execute("RepeatFind", pset.HSet))
 
 
+def _retry_title_table_locator(hwp, expected_name):
+    """Resolve one failed single-table record from its own title only.
+
+    The normal splitter never walks the document text: rhwp supplies the table
+    stream and HWP copies by control identity.  Some legacy documents expose a
+    ``tbl`` control whose HeadCtrl ordinal differs from rhwp at a nested-table
+    boundary.  If, and only if, the saved one-table result fails the rhwp title
+    check, look for that one expected site name and turn its containing table
+    back into a live HWP control locator.  The caller validates the retry the
+    same way, so this cannot silently accept a different table.
+    """
+    parts = expected_name.split(" ", 1)
+    site_name = parts[1] if len(parts) == 2 else expected_name
+    hwp.Run("MoveDocBegin")
+    if not _repeat_find_from_caret(hwp, site_name):
+        raise RuntimeError(f"검산 실패한 제목을 원본에서 다시 찾지 못했습니다: {site_name}")
+    hwp.Run("Cancel")
+    parent = hwp.ParentCtrl
+    if parent is None or str(getattr(parent, "CtrlID", "")) != "tbl":
+        raise RuntimeError(f"검산 실패한 제목의 표 개체를 찾지 못했습니다: {site_name}")
+    anchor = parent.GetAnchorPos(0)
+    anchor_position = (
+        int(anchor.Item("List")),
+        int(anchor.Item("Para")),
+        int(anchor.Item("Pos")),
+    )
+    if not hwp.SetPosBySet(anchor) or hwp.FindCtrl() != "tbl":
+        raise RuntimeError(f"검산 실패한 제목 표를 다시 선택하지 못했습니다: {site_name}")
+    return {
+        "position": tuple(hwp.GetPos()),
+        "anchor": anchor,
+        "anchor_position": anchor_position,
+        # HWP 2018 does not expose a reliable control instance ID here.  The
+        # fresh anchor route in _select_table_control remains available.
+        "control_instance_id": None,
+    }
+
+
 def _logical_record_starts(hwp, names, logger=None):
     """Locate logical record starts in document order, without page guessing.
 
@@ -1960,14 +1998,39 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
                 continue
             if rebuild_duplicate_group:
                 emit_log(logger, f"  동명 유적 묶음 재생성: {output_path.name}")
-            _save_table_group_in_tab(
-                hwp,
-                positions,
-                output_path,
-                input_path.stat().st_size,
-                expected_name=name,
-                logger=logger,
-            )
+            try:
+                _save_table_group_in_tab(
+                    hwp,
+                    positions,
+                    output_path,
+                    input_path.stat().st_size,
+                    expected_name=name,
+                    logger=logger,
+                )
+            except RuntimeError as exc:
+                # Do not replace the normal rhwp/control-order workflow with
+                # title searches.  Recover only the exact one-table case where
+                # the saved result proves that the selected tbl was not its
+                # expected heading table.  Multi-table records remain fail
+                # closed: guessing their photo-table boundary would be worse
+                # than stopping with an error.
+                missing_title = "저장본에" in str(exc) and "제목 표가 없습니다" in str(exc)
+                if len(positions) != 1 or not missing_title:
+                    raise
+                emit_log(
+                    logger,
+                    "  [복구] 검산에 실패한 단일 표만 제목 표로 다시 확인합니다 "
+                    "(본문 전체를 읽지 않습니다)...",
+                )
+                corrected_position = _retry_title_table_locator(hwp, name)
+                _save_table_group_in_tab(
+                    hwp,
+                    [corrected_position],
+                    output_path,
+                    input_path.stat().st_size,
+                    expected_name=name,
+                    logger=logger,
+                )
             saved.append(output_path)
         emit_progress(progress_callback, {"type": "progress", "current": total, "total": total, "status": "분리 완료"})
         return saved
