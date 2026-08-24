@@ -102,6 +102,120 @@ def _raise_if_clipboard_changed(copy_sequence):
         )
 
 
+def _normalize_document_path(document_path):
+    """Normalize a COM document path-like value for comparison."""
+    if not document_path:
+        return ""
+    try:
+        return os.path.normcase(os.path.normpath(str(document_path)))
+    except Exception:
+        return str(document_path).strip()
+
+
+def _read_document_path(document):
+    """Return best-effort file path for a HWP document."""
+    if document is None:
+        return ""
+    for attr in ("Path", "FullPath", "FilePath", "URL", "URLPath", "FullName", "Name"):
+        try:
+            value = getattr(document, attr)
+        except Exception:
+            continue
+        try:
+            if callable(value):
+                value = value()
+        except Exception:
+            pass
+        normalized = _normalize_document_path(value)
+        if normalized:
+            return normalized
+    try:
+        path = getattr(document, "Title", "")
+        return _normalize_document_path(path)
+    except Exception:
+        return ""
+
+
+def _iterate_documents(hwp):
+    """Iterate open HWP documents while tolerating 0/1-based collection indices."""
+    documents = []
+    seen = set()
+    try:
+        count = int(hwp.XHwpDocuments.Count)
+    except Exception:
+        return documents
+    for index in range(count):
+        for item_index in (index, index + 1):
+            try:
+                document = hwp.XHwpDocuments.Item(item_index)
+            except Exception:
+                continue
+            if not document:
+                continue
+            try:
+                identity = str(document.DocumentID)
+            except Exception:
+                identity = repr(document)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            documents.append(document)
+    return documents
+
+
+def _find_document_by_id(hwp, document_id):
+    """Find an open document by ID using all supported lookup paths."""
+    target = _normalize_document_path(document_id)
+    if not target:
+        return None
+    by_find = None
+    try:
+        by_find = hwp.XHwpDocuments.FindItem(document_id)
+    except Exception:
+        by_find = None
+    if by_find is not None:
+        return by_find
+    for document in _iterate_documents(hwp):
+        try:
+            if str(document.DocumentID) == target:
+                return document
+        except Exception:
+            continue
+    return None
+
+
+def _find_document_by_path(hwp, document_path):
+    target = _normalize_document_path(document_path)
+    if not target:
+        return None
+    for document in _iterate_documents(hwp):
+        try:
+            doc_path = _read_document_path(document)
+            if doc_path and doc_path == target:
+                return document
+        except Exception:
+            continue
+    return None
+
+
+def _activate_document_object(hwp, document):
+    """Try to activate a specific document object."""
+    if document is None:
+        return False
+    try:
+        document.SetActive_XHwpDocument()
+    except Exception:
+        return False
+    try:
+        active_id = hwp.XHwpDocuments.Active_XHwpDocument.DocumentID
+    except Exception:
+        return False
+    try:
+        return str(active_id) == str(document.DocumentID)
+    except Exception:
+        return False
+
+
 def _bundled_file(relative_path):
     for root in _APP_ROOTS:
         if root is None:
@@ -762,29 +876,47 @@ def _document_tab_snapshot(hwp):
     except Exception as exc:
         parts.append(f"현재 탭 ID 읽기 실패={_selection_exception(exc)}")
     try:
-        parts.append(f"열린 탭 수={hwp.XHwpDocuments.Count}")
+        count = hwp.XHwpDocuments.Count
+        parts.append(f"열린 탭 수={count}")
+        try:
+            open_ids = []
+            for document in _iterate_documents(hwp):
+                try:
+                    open_ids.append(str(document.DocumentID))
+                except Exception:
+                    open_ids.append("?")
+            if open_ids:
+                parts.append(f"열린 탭 ID 목록={open_ids}")
+        except Exception:
+            pass
     except Exception as exc:
         parts.append(f"열린 탭 수 읽기 실패={_selection_exception(exc)}")
     return ", ".join(parts)
 
 
-def _activate_document_by_id(hwp, document_id):
+def _activate_document_by_id(hwp, document_id, fallback_path=None):
     """Activate a live HWP document by ID instead of a stale tab reference.
 
     HWP 2018 can leave an ``XHwpDocument`` reference pointing at a tab that
     is no longer activated after ``FileNew``/``Open``.  Looking it up again in
     ``XHwpDocuments`` is independent of table names and works for every tab.
     """
+    fallback_path = _normalize_document_path(fallback_path)
     last_active_id = None
     for attempt in range(15):
-        document = hwp.XHwpDocuments.FindItem(document_id)
+        document = _find_document_by_id(hwp, document_id)
         if document is None:
-            raise RuntimeError(f"문서 탭 ID {document_id}를 찾지 못했습니다.")
-        document.SetActive_XHwpDocument()
-        active_id = hwp.XHwpDocuments.Active_XHwpDocument.DocumentID
-        if str(active_id) == str(document_id):
+            if fallback_path:
+                document = _find_document_by_path(hwp, fallback_path)
+            if document is None:
+                last_active_id = None
+        if document is not None and _activate_document_object(hwp, document):
             return document
-        last_active_id = active_id
+        try:
+            active_id = hwp.XHwpDocuments.Active_XHwpDocument.DocumentID
+            last_active_id = active_id
+        except Exception as exc:
+            last_active_id = f"읽기 실패({_selection_exception(exc)})"
         # HWP 2018 sometimes acknowledges Open/FileNew before its document
         # tab manager is ready to activate another tab.  Reacquire the live
         # document object rather than reusing the previous COM reference.
@@ -1922,6 +2054,7 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
 
     source_document = source_hwp.XHwpDocuments.Active_XHwpDocument
     source_document_id = source_document.DocumentID
+    source_document_path = _read_document_path(source_document)
     destination_document = None
     a3_page_setup = None
     try:
@@ -1929,7 +2062,7 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
         # then load the real A3 template into that tab.  The source therefore
         # remains a separate document and the destination has an actual A3
         # section before any table is pasted.
-        _activate_document_by_id(source_hwp, source_document_id)
+        _activate_document_by_id(source_hwp, source_document_id, fallback_path=source_document_path)
         a3_width, a3_height = _a3_template_dimensions()
         source_hwp.HAction.Run("FileNew")
         time.sleep(0.15)
@@ -1940,6 +2073,7 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
         time.sleep(0.15)
         destination_document = source_hwp.XHwpDocuments.Active_XHwpDocument
         destination_document_id = destination_document.DocumentID
+        destination_document_path = _read_document_path(destination_document)
         if destination_document.DocumentID == source_document_id:
             raise RuntimeError("A3 출력용 새 탭을 별도로 만들지 못했습니다.")
         a3_page_setup = _read_current_page_setup(source_hwp)
@@ -1955,7 +2089,7 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
         emit_log(logger, f"  A3 바탕 탭에 표 {len(positions)}개를 넣는 중...")
         for number, position in enumerate(positions, start=1):
             tab_before_activation = _document_tab_snapshot(source_hwp)
-            _activate_document_by_id(source_hwp, source_document_id)
+            _activate_document_by_id(source_hwp, source_document_id, fallback_path=source_document_path)
             tab_after_activation = _document_tab_snapshot(source_hwp)
             found_control, selection_route, selection_trace = _select_table_control(source_hwp, position)
             # Keep successful bulk runs readable, but always show the first
@@ -1992,14 +2126,22 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
             # was being activated.
             time.sleep(0.03)
             copy_sequence = _clipboard_sequence_number()
-            _activate_document_by_id(source_hwp, destination_document_id)
+            _activate_document_by_id(
+                source_hwp,
+                destination_document_id,
+                fallback_path=destination_document_path,
+            )
             _raise_if_clipboard_changed(copy_sequence)
             source_hwp.Run("MoveDocEnd")
             if number > 1:
                 source_hwp.Run("BreakPara")
             source_hwp.HAction.Run("Paste")
 
-        _activate_document_by_id(source_hwp, destination_document_id)
+        _activate_document_by_id(
+            source_hwp,
+            destination_document_id,
+            fallback_path=destination_document_path,
+        )
         applied_page_setup = _read_current_page_setup(source_hwp)
         if (
             abs(applied_page_setup["PaperWidth"] - a3_width) > 10
@@ -2031,7 +2173,7 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
             if destination_document is not None:
                 destination_document.Modified = False
                 destination_document.Close(False)
-            _activate_document_by_id(source_hwp, source_document_id)
+            _activate_document_by_id(source_hwp, source_document_id, fallback_path=source_document_path)
         except Exception:
             pass
 
