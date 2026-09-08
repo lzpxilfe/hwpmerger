@@ -4,6 +4,7 @@ import re
 import time
 import ctypes
 import gc
+import hashlib
 import json
 import subprocess
 import sys
@@ -40,6 +41,75 @@ _APP_ROOTS = (
 _RHWP_RELATIVE_PATH = Path("tools") / "rhwp" / "rhwp" / "rhwp.exe"
 _A3_TEMPLATE_HWP_RELATIVE_PATH = Path("resources") / "a3_blank.hwp"
 _A3_TEMPLATE_HWPX_RELATIVE_PATH = Path("resources") / "a3_blank.hwpx"
+_SPLIT_BUILD_VERSION = "v41"
+_MAX_TABLE_GROUP_ATTEMPTS = 3
+
+
+class SplitExecutionResult(list):
+    """List-compatible split result with a durable per-record summary."""
+
+    def __init__(self, saved_paths=(), summary=None, journal_path=None):
+        super().__init__(saved_paths)
+        self.summary = summary or {}
+        self.journal_path = Path(journal_path) if journal_path else None
+
+
+def _sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _write_split_journal(path, journal):
+    """Atomically checkpoint split progress so a rerun can safely resume."""
+    path = Path(path)
+    temporary = path.with_name(f".{path.name}.partial")
+    temporary.write_text(
+        json.dumps(journal, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    os.replace(temporary, path)
+
+
+def _load_split_journal(path, input_path, output_plan, groups):
+    path = Path(path)
+    source_hash = _sha256_file(input_path)
+    journal = None
+    try:
+        journal = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        pass
+    if not isinstance(journal, dict) or journal.get("source_sha256") != source_hash:
+        journal = {
+            "format": "hwpmerger-split-v41",
+            "source_path": str(Path(input_path)),
+            "source_sha256": source_hash,
+            "items": {},
+        }
+    journal["build"] = _SPLIT_BUILD_VERSION
+    journal["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    items = journal.setdefault("items", {})
+    for item, positions in zip(output_plan, groups):
+        key = str(item["index"])
+        existing = items.get(key, {})
+        items[key] = {
+            **existing,
+            "index": item["index"],
+            "name": item["name"],
+            "filename": item["filename"],
+            "expected_table_count": len(positions),
+        }
+    _write_split_journal(path, journal)
+    return journal
+
+
+def _checkpoint_split_item(journal_path, journal, index, **changes):
+    record = journal.setdefault("items", {}).setdefault(str(index), {"index": index})
+    record.update(changes)
+    journal["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    _write_split_journal(journal_path, journal)
 
 
 def emit_progress(progress_callback, payload):
@@ -192,15 +262,16 @@ def _hwp_save_as(hwp, file_path, logger=None):
             if not _is_retriable_save_error(exc):
                 raise
 
-    if logger:
-        emit_log(logger, "[호환성 실패] SaveAs: 시그니처 후보가 모두 실패했습니다.")
     try:
-        return _hwp_save_as_via_action(hwp, target, logger=logger)
+        result = _hwp_save_as_via_action(hwp, target, logger=logger)
+        if logger:
+            emit_log(logger, "  [호환성 보정] SaveAs COM 호출 대신 한글 저장 동작으로 저장했습니다.")
+        return result
     except Exception as exc:
         if logger:
             emit_log(
                 logger,
-                f"[저장 방법 실패] SaveAs 대체 루트를 모두 시도했지만 실패했습니다: {exc!r}",
+                f"[저장 방법 실패] SaveAs와 한글 저장 동작이 모두 실패했습니다: {exc!r}",
             )
         if isinstance(last_error, pywintypes.com_error):
             raise last_error
@@ -1670,7 +1741,7 @@ def build_table_split_plan(hwp, logger=None):
     and never fabricates a page number.
     """
     total_pages = hwp.PageCount
-    emit_log(logger, "[빌드] 다중 표 묶음 + A3·용량 검증 v40 (2026-09-08)")
+    emit_log(logger, "[빌드] 다중 표 묶음 + 단계별 저장 검산 v41 (2026-09-08)")
     emit_log(logger, f"HWP 표 이름 분석 중 (총 {total_pages}페이지)...")
 
     # This legacy HWP exposes form text in the document text stream but not
@@ -2318,6 +2389,47 @@ def _has_valid_existing_table_bundle(output_path, expected_name, expected_table_
     return True
 
 
+def _run_required_hwp_action(hwp, action_name, stage):
+    """Run an HWP action and reject the explicit failure value."""
+    result = hwp.HAction.Run(action_name)
+    if result is False:
+        raise RuntimeError(f"한글이 {stage} 동작을 거부했습니다: {action_name}")
+    return result
+
+
+def _prepare_destination_paste_location(hwp, append_after_existing):
+    """Leave the destination at a plain paragraph after its final table."""
+    try:
+        hwp.Run("Cancel")
+    except Exception:
+        pass
+    hwp.Run("MoveDocEnd")
+    if append_after_existing:
+        result = hwp.Run("BreakPara")
+        if result is False:
+            raise RuntimeError("다음 표를 위한 본문 문단을 만들지 못했습니다.")
+        hwp.Run("MoveDocEnd")
+    selected = _selected_control_id(hwp)
+    if selected == "tbl":
+        raise RuntimeError("출력 문서의 마지막 표 밖으로 커서를 이동하지 못했습니다.")
+    return _selection_snapshot(hwp, include_selected_range=True)
+
+
+def _verify_incremental_bundle(stage_path, expected_name, expected_table_count):
+    """Verify each appended table before another table can overwrite it."""
+    stage_path = Path(stage_path)
+    if not stage_path.is_file() or stage_path.stat().st_size == 0:
+        raise RuntimeError("표 삽입 직후 임시 저장본을 찾지 못했습니다.")
+    saved_count = _verify_saved_table_bundle(
+        stage_path, expected_name, expected_table_count
+    )
+    if saved_count < expected_table_count:
+        raise RuntimeError(
+            f"표 {expected_table_count}개 중 {saved_count}개만 임시 저장본에 남았습니다."
+        )
+    return saved_count
+
+
 def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, expected_name, logger=None):
     """Paste a group into an A3-configured tab, then validate the saved HWP."""
     if not positions:
@@ -2327,6 +2439,7 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
     working_path = output_path.with_name(f".{output_path.stem}.partial{output_path.suffix}")
     if working_path.exists():
         working_path.unlink()
+    stage_paths = []
 
     source_document = _safe_active_document(source_hwp)
     if source_document is None:
@@ -2451,26 +2564,56 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
                     f"묶음의 {number}번째 표 개체를 선택하지 못했습니다 "
                     f"(시도: {selection_route}; 한글 응답: {found_control or '없음'})."
                 )
-            source_hwp.HAction.Run("Copy")
-            emit_log(logger, f"  [단계] 표 {number}/{len(positions)} 복사 완료")
+            copy_started = time.monotonic()
+            _run_required_hwp_action(source_hwp, "Copy", f"표 {number}/{len(positions)} 복사")
             # Copy/Paste is an unavoidable HWP 2018 clipboard handoff.  Take
             # the sequence after HWP has populated it, then reject a paste if
             # another application copied something while the destination tab
             # was being activated.
             time.sleep(0.03)
             copy_sequence = _clipboard_sequence_number()
+            emit_log(
+                logger,
+                f"  [단계] 표 {number}/{len(positions)} 복사 확인 "
+                f"({int((time.monotonic() - copy_started) * 1000)} ms, 클립보드={copy_sequence})",
+            )
             _activate_document_by_id(
                 source_hwp,
                 destination_document_id,
                 fallback_path=destination_document_path,
             )
             _raise_if_clipboard_changed(copy_sequence)
-            source_hwp.Run("MoveDocEnd")
-            if number > 1:
-                source_hwp.Run("BreakPara")
-            emit_log(logger, f"  [단계] 표 {number}/{len(positions)} 붙여넣기 실행")
-            source_hwp.HAction.Run("Paste")
+            destination_state = _prepare_destination_paste_location(
+                source_hwp, append_after_existing=(number > 1)
+            )
+            _raise_if_clipboard_changed(copy_sequence)
+            paste_started = time.monotonic()
+            _run_required_hwp_action(source_hwp, "Paste", f"표 {number}/{len(positions)} 붙여넣기")
             _apply_page_setup(source_hwp, a3_page_setup)
+            _raise_if_clipboard_changed(copy_sequence)
+            emit_log(
+                logger,
+                f"  [단계] 표 {number}/{len(positions)} 붙여넣기 호출 완료 "
+                f"({int((time.monotonic() - paste_started) * 1000)} ms, 출력 위치={destination_state})",
+            )
+            # A second table used to be accepted blindly and was only noticed
+            # after the entire group had been closed.  Save and read the
+            # destination after every append so an incomplete draft is thrown
+            # away before it can become a final file.
+            if len(positions) > 1:
+                stage_path = output_path.with_name(
+                    f".{output_path.stem}.stage-{number}{output_path.suffix}"
+                )
+                if stage_path.exists():
+                    stage_path.unlink()
+                stage_paths.append(stage_path)
+                emit_log(logger, f"  [검산] 표 {number}/{len(positions)} 삽입 직후 구조 확인 중...")
+                _hwp_save_as(source_hwp, stage_path, logger=logger)
+                time.sleep(0.12)
+                stage_count = _verify_incremental_bundle(
+                    stage_path, expected_name, number
+                )
+                emit_log(logger, f"  [검산] 표 {number}/{len(positions)} 확인 완료 (저장본 표 {stage_count}개)")
 
         _activate_document_by_id(
             source_hwp,
@@ -2486,10 +2629,9 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
                 a3_height,
                 logger=logger,
             ):
-                emit_log(
-                    logger,
-                    "  [경고] 출력 문서 A3 설정을 1회 재적용해도 안정적으로 확인되지 않았습니다. "
-                    "현재 값으로 저장을 계속 진행합니다.",
+                raise RuntimeError(
+                    "출력 문서의 A3 설정을 3회 재적용해도 확인하지 못했습니다. "
+                    "잘린 파일을 만들지 않기 위해 이 묶음을 저장하지 않습니다."
                 )
         # HeadCtrl omits nested photo tables on some forms.  The saved file is
         # verified below with rhwp, which counts every real table and rejects
@@ -2503,6 +2645,12 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
                 working_path.unlink()
         except OSError:
             pass
+        for stage_path in stage_paths:
+            try:
+                if stage_path.exists():
+                    stage_path.unlink()
+            except OSError:
+                pass
         raise
     finally:
         try:
@@ -2517,10 +2665,6 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
         if not working_path.exists() or working_path.stat().st_size == 0:
             raise RuntimeError("A3 임시 저장본을 찾지 못했습니다.")
         saved_size = working_path.stat().st_size
-        if source_size and saved_size >= source_size * 0.25:
-            raise RuntimeError(
-                f"원본 전체가 복사된 것으로 보입니다 ({saved_size / 1024 / 1024:.1f} MB)."
-            )
         saved_table_count = _verify_saved_table_bundle(
             working_path, expected_name, len(positions)
         )
@@ -2531,6 +2675,12 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
                 working_path.unlink()
         except OSError:
             pass
+        for stage_path in stage_paths:
+            try:
+                if stage_path.exists():
+                    stage_path.unlink()
+            except OSError:
+                pass
         raise
 
     emit_log(
@@ -2538,6 +2688,12 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
         f"  A3 표 묶음 저장 완료: {output_path.name} ({saved_size / 1024:.1f} KB, "
         f"표 {saved_table_count}개, 용지 297×420 mm)",
     )
+    for stage_path in stage_paths:
+        try:
+            if stage_path.exists():
+                stage_path.unlink()
+        except OSError:
+            pass
     return output_path
 
 
@@ -2559,6 +2715,10 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
         )
         total = len(planned_names)
         output_plan = build_table_output_plan(planned_names, pattern)
+        journal_path = output_dir / "hwp_split_v41_journal.json"
+        journal = _load_split_journal(journal_path, input_path, output_plan, groups)
+        failed = []
+        existing_count = 0
         newly_saved_since_restart = 0
         if _HWP_RESTART_EVERY_N_TABLE_GROUPS > 0:
             emit_log(
@@ -2665,12 +2825,23 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
             if not rebuild_duplicate_group and _has_valid_existing_table_bundle(output_path, name, len(positions)):
                 emit_log(logger, f"  기존 검산 통과 파일 유지: {output_path.name}")
                 saved.append(output_path)
+                existing_count += 1
+                _checkpoint_split_item(
+                    journal_path, journal, index,
+                    state="existing_verified", attempts=0,
+                    output_path=str(output_path), verified_table_count=len(positions),
+                )
                 continue
             if rebuild_duplicate_group:
                 emit_log(logger, f"  동명 유적 묶음 재생성: {output_path.name}")
             try:
                 for clipboard_attempt in range(1, 4):
                     try:
+                        _checkpoint_split_item(
+                            journal_path, journal, index,
+                            state="running", attempts=clipboard_attempt,
+                            output_path=str(output_path), error=None,
+                        )
                         _save_table_group_in_tab(
                             hwp,
                             positions,
@@ -2721,7 +2892,7 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
                             positions = groups[group_index]
                             continue
                         if not _is_hwp_memory_error(exc):
-                            raise
+                            raise RuntimeError(str(exc)) from exc
                         if clipboard_attempt == 3:
                             raise RuntimeError(
                                 "한글이 메모리 부족을 반복 보고해 이 표 묶음을 저장하지 않았습니다. "
@@ -2741,7 +2912,24 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
                 # table count, so multi-table photo records remain fail-closed.
                 missing_title = "저장본에" in str(exc) and "제목 표가 없습니다" in str(exc)
                 if not missing_title:
-                    raise
+                    failure = {
+                        "index": index,
+                        "name": name,
+                        "filename": output_path.name,
+                        "error": str(exc),
+                    }
+                    failed.append(failure)
+                    _checkpoint_split_item(
+                        journal_path, journal, index,
+                        state="failed", attempts=_MAX_TABLE_GROUP_ATTEMPTS,
+                        output_path=str(output_path), error=str(exc),
+                    )
+                    emit_log(logger, f"  [실패 기록] {output_path.name}: {exc} — 다음 묶음을 계속 처리합니다.")
+                    emit_progress(progress_callback, {
+                        "type": "progress", "current": index, "total": total,
+                        "status": f"실패 기록 후 다음 묶음 진행 ({index}/{total})",
+                    })
+                    continue
                 next_name = (
                     output_plan[group_index + 1]["name"]
                     if group_index + 1 < len(output_plan)
@@ -2759,15 +2947,35 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
                     len(positions),
                     positions[0],
                 )
-                _save_table_group_in_tab(
-                    hwp,
-                    corrected_positions,
-                    output_path,
-                    input_path.stat().st_size,
-                    expected_name=name,
-                    logger=logger,
-                )
+                try:
+                    _save_table_group_in_tab(
+                        hwp,
+                        corrected_positions,
+                        output_path,
+                        input_path.stat().st_size,
+                        expected_name=name,
+                        logger=logger,
+                    )
+                except Exception as correction_exc:
+                    failed.append({
+                        "index": index,
+                        "name": name,
+                        "filename": output_path.name,
+                        "error": str(correction_exc),
+                    })
+                    _checkpoint_split_item(
+                        journal_path, journal, index,
+                        state="failed", attempts=_MAX_TABLE_GROUP_ATTEMPTS,
+                        output_path=str(output_path), error=str(correction_exc),
+                    )
+                    emit_log(logger, f"  [실패 기록] 제목 경계 복구도 실패: {output_path.name}: {correction_exc}")
+                    continue
             saved.append(output_path)
+            _checkpoint_split_item(
+                journal_path, journal, index,
+                state="saved_verified", attempts=clipboard_attempt,
+                output_path=str(output_path), verified_table_count=len(positions), error=None,
+            )
             newly_saved_since_restart += 1
             # Photo-heavy A3 tables are handled by HWP's native process, not
             # Python's heap.  Recycling that process in bounded batches keeps
@@ -2783,8 +2991,28 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
                     f"사진 표 {_HWP_RESTART_EVERY_N_TABLE_GROUPS}개 묶음 저장 후 메모리 정리"
                 )
                 newly_saved_since_restart = 0
-        emit_progress(progress_callback, {"type": "progress", "current": total, "total": total, "status": "분리 완료"})
-        return saved
+        summary = {
+            "saved": len(saved) - existing_count,
+            "existing_verified": existing_count,
+            "failed": len(failed),
+            "unprocessed": 0,
+            "total": total,
+            "journal_path": str(journal_path),
+            "failures": failed,
+        }
+        _write_split_journal(journal_path, journal)
+        if failed:
+            emit_log(
+                logger,
+                f"[완료(확인 필요)] 새 저장 {summary['saved']}개, 기존 검산 통과 {existing_count}개, "
+                f"실패 {len(failed)}개. 실패 목록: {journal_path}",
+            )
+            status = f"분리 완료(실패 {len(failed)}개 기록)"
+        else:
+            emit_log(logger, f"[완료] 새 저장 {summary['saved']}개, 기존 검산 통과 {existing_count}개")
+            status = "분리 완료"
+        emit_progress(progress_callback, {"type": "progress", "current": total, "total": total, "status": status})
+        return SplitExecutionResult(saved, summary=summary, journal_path=journal_path)
     finally:
         try:
             hwp.Quit()

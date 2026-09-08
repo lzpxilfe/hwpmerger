@@ -510,7 +510,7 @@ class SplitTab:
     def _preview_worker(self, input_file, mode, n, pattern):
         pythoncom.CoInitialize()
         q = self.message_queue
-        q.put({"type": "log", "message": "[빌드] rhwp 표 구조 + 실제 A3 바탕 탭 검증 v40 (2026-09-08)"})
+        q.put({"type": "log", "message": "[빌드] rhwp 표 구조 + 단계별 저장 검산 v41 (2026-09-08)"})
 
         def logger(msg):
             q.put({"type": "log", "message": msg})
@@ -629,7 +629,13 @@ class SplitTab:
                 progress_callback=progress_callback,
                 split_by_table=split_by_table,
             )
-            q.put({"type": "split_complete", "count": len(saved), "output_dir": output_dir})
+            q.put({
+                "type": "split_complete",
+                "count": len(saved),
+                "output_dir": output_dir,
+                "summary": getattr(saved, "summary", {}),
+                "journal_path": str(getattr(saved, "journal_path", "") or ""),
+            })
         except Exception as exc:
             q.put({"type": "error", "message": str(exc)})
         finally:
@@ -695,8 +701,26 @@ class SplitTab:
                 elif mtype == "split_complete":
                     count = msg["count"]
                     out_dir = msg["output_dir"]
-                    self.status_var.set(f"분리 완료 ({count}개 파일)")
-                    if messagebox.askyesno("완료", f"분리가 완료되었습니다!\n총 {count}개 파일 → {out_dir}\n\n결과 폴더를 여시겠습니까?"):
+                    summary = msg.get("summary") or {}
+                    failed = int(summary.get("failed", 0))
+                    existing = int(summary.get("existing_verified", 0))
+                    saved_now = int(summary.get("saved", count))
+                    journal_path = msg.get("journal_path") or summary.get("journal_path", "")
+                    if failed:
+                        self.status_var.set(f"분리 완료: 새 저장 {saved_now}개, 기존 확인 {existing}개, 실패 {failed}개")
+                        complete_message = (
+                            f"분리 작업이 끝났습니다.\n\n새 저장: {saved_now}개\n"
+                            f"기존 검산 통과: {existing}개\n실패: {failed}개\n\n"
+                            f"실패 항목은 다음 실행에서 자동 재시도됩니다.\n작업 기록: {journal_path}\n\n"
+                            "결과 폴더를 여시겠습니까?"
+                        )
+                    else:
+                        self.status_var.set(f"분리 완료 ({count}개 파일)")
+                        complete_message = (
+                            f"분리가 완료되었습니다!\n총 {count}개 파일 → {out_dir}\n\n"
+                            "결과 폴더를 여시겠습니까?"
+                        )
+                    if messagebox.askyesno("분리 결과", complete_message):
                         self.open_result_dir()
 
                 elif mtype == "done":
@@ -731,7 +755,7 @@ class SplitTab:
 class HwpMergerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("HWP 파일 병합/분리기 - rhwp 표 구조 · 실제 A3 바탕 탭 v40")
+        self.root.title("HWP 파일 병합/분리기 - rhwp 표 구조 · 단계별 저장 검산 v41")
         self.root.geometry("880x740")
         self.root.minsize(760, 620)
 
