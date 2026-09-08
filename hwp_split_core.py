@@ -170,6 +170,26 @@ def _hwp_select_ctrl_by_instance(hwp, control_instance_id, logger=None):
     )
 
 
+def _hwp_document_add(hwp, logger=None):
+    """Create a new document/tab in the current process with argument-safe fallback."""
+    return _call_with_arg_compatibility(
+        "XHwpDocuments.Add",
+        hwp.XHwpDocuments.Add,
+        [((1,), {}), ((), {}), ((True,), {})],
+        logger=logger,
+    )
+
+
+def _hwp_document_close(document, save=False, logger=None):
+    """Close one HWP document with version-safe close signatures."""
+    return _call_with_arg_compatibility(
+        "Document.Close",
+        document.Close,
+        [((save,), {}), ((bool(save),), {}), ((1 if save else 0,), {}), ((), {})],
+        logger=logger,
+    )
+
+
 def _clipboard_sequence_number():
     """Return Windows' clipboard change counter, or None if it is unavailable.
 
@@ -1049,7 +1069,7 @@ def _close_document_by_id(hwp, document_id):
         pass
     try:
         document.Modified = False
-        document.Close(False)
+        _hwp_document_close(document, save=False)
         return True
     except Exception:
         return False
@@ -1924,7 +1944,7 @@ def _save_selected_table_in_fresh_hwp(source_hwp, output_path, source_size, logg
     source_document_id = source_document.DocumentID
     emit_log(logger, "  임시 저장 탭 준비 중...")
     try:
-        destination_document = source_hwp.XHwpDocuments.Add(True)
+        destination_document = _hwp_document_add(source_hwp, logger=logger)
         destination_document.SetActive_XHwpDocument()
         _apply_page_setup(source_hwp, page_setup)
         source_document.SetActive_XHwpDocument()
@@ -1939,8 +1959,10 @@ def _save_selected_table_in_fresh_hwp(source_hwp, output_path, source_size, logg
             # Close the exact temporary document.  Closing the collection's
             # active item can close the source instead on HWP 2018.
             destination_document.Modified = False
-            destination_document.Close(False)
-            source_hwp.XHwpDocuments.FindItem(source_document_id).SetActive_XHwpDocument()
+            _hwp_document_close(destination_document, save=False, logger=logger)
+            source_document = _find_document_by_id(source_hwp, source_document_id)
+            if source_document is not None:
+                source_document.SetActive_XHwpDocument()
         except Exception:
             pass
 
@@ -2332,7 +2354,7 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
         try:
             if destination_document is not None:
                 destination_document.Modified = False
-                destination_document.Close(False)
+                _hwp_document_close(destination_document, save=False, logger=logger)
             _activate_document_by_id(source_hwp, source_document_id, fallback_path=source_document_path)
         except Exception:
             pass
