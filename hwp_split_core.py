@@ -112,6 +112,20 @@ def _is_wrong_param_count_error(exc):
     )
 
 
+def _is_retriable_save_error(exc):
+    if _is_wrong_param_count_error(exc):
+        return True
+    if isinstance(exc, pywintypes.com_error):
+        try:
+            hresult = exc.args[0]
+            # Call was rejected by the target app, often a version-specific SaveAs path.
+            if hresult in (-2147417851, -2147418111, -2147418109):
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def _call_with_arg_compatibility(operation_name, callee, variants, logger=None):
     """Try multiple signatures for version-dependent COM methods.
 
@@ -151,21 +165,46 @@ def _hwp_open(hwp, file_path, mode="HWP", forceopen="forceopen:true", logger=Non
 
 def _hwp_save_as(hwp, file_path, logger=None):
     target = os.path.normpath(str(file_path))
+    candidates = [
+        ((target, "HWP"), {}),
+        ((target, "HWP", 0), {}),
+        ((target, 0), {}),
+        ((target, True), {}),
+        ((target,), {}),
+    ]
+    last_error = None
+    for index, (args, kwargs) in enumerate(candidates, start=1):
+        try:
+            if kwargs:
+                result = hwp.SaveAs(*args, **kwargs)
+            else:
+                result = hwp.SaveAs(*args)
+            if result is not False:
+                if logger and index > 1:
+                    emit_log(
+                        logger,
+                        f"  [호환성 보정] SaveAs: 시그니처 {index}번으로 재시도 성공",
+                    )
+                return result
+            last_error = RuntimeError("SaveAs returned False")
+        except Exception as exc:
+            last_error = exc
+            if not _is_retriable_save_error(exc):
+                raise
+
+    if logger:
+        emit_log(logger, "[호환성 실패] SaveAs: 시그니처 후보가 모두 실패했습니다.")
     try:
-        return _call_with_arg_compatibility(
-            "SaveAs",
-            hwp.SaveAs,
-            [
-                ((target, "HWP"), {}),
-                ((target, "HWP", 0), {}),
-                ((target, 0), {}),
-                ((target, True), {}),
-                ((target,), {}),
-            ],
-            logger=logger,
-        )
-    except Exception:
         return _hwp_save_as_via_action(hwp, target, logger=logger)
+    except Exception as exc:
+        if logger:
+            emit_log(
+                logger,
+                f"[저장 방법 실패] SaveAs 대체 루트를 모두 시도했지만 실패했습니다: {exc!r}",
+            )
+        if isinstance(last_error, pywintypes.com_error):
+            raise last_error
+        raise
 
 
 def _hwp_save_as_via_action(hwp, file_path, logger=None):
