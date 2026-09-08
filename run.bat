@@ -1,7 +1,7 @@
 @echo off
 setlocal
 cd /d "%~dp0"
-echo [HWP Merger] rhwp-structure-actual-a3-template-tab v37 build 2026-08-19
+echo [HWP Merger] rhwp-structure-actual-a3-template-tab v38 build 2026-09-08
 if not defined HWP_RESTART_EVERY_N_TABLE_GROUPS set HWP_RESTART_EVERY_N_TABLE_GROUPS=20
 python -c "import pythoncom" >nul 2>nul
 if not errorlevel 1 goto run_python
