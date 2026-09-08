@@ -1336,6 +1336,59 @@ def _apply_page_setup(hwp, values):
     action.Execute(settings)
 
 
+def _paper_size_is_a3(page_setup, a3_width, a3_height):
+    """Return True when section size is close to A3."""
+    return (
+        abs(page_setup["PaperWidth"] - a3_width) <= 10
+        and abs(page_setup["PaperHeight"] - a3_height) <= 10
+    )
+
+
+def _ensure_a3_setup(hwp, template_setup, expected_width, expected_height, attempts=3, logger=None):
+    """Re-apply and verify A3 settings with bounded retries."""
+    a3_values = dict(template_setup or {})
+    if "PaperWidth" not in a3_values:
+        a3_values["PaperWidth"] = expected_width
+    if "PaperHeight" not in a3_values:
+        a3_values["PaperHeight"] = expected_height
+    if "Landscape" not in a3_values:
+        a3_values["Landscape"] = 0
+    for index in range(1, attempts + 1):
+        try:
+            _apply_page_setup(hwp, a3_values)
+        except Exception as exc:
+            if logger:
+                emit_log(logger, f"  [페이지 설정 재적용] 시도 {index}/{attempts} 실패: {exc!r}")
+        time.sleep(0.08)
+        try:
+            current = _read_current_page_setup(hwp)
+        except Exception as exc:
+            if logger:
+                emit_log(
+                    logger,
+                    f"  [페이지 설정 확인] 시도 {index}/{attempts} 실패: {exc!r}",
+                )
+            continue
+        if _paper_size_is_a3(current, expected_width, expected_height):
+            return True
+            if logger:
+                emit_log(
+                    logger,
+                    f"  [페이지 설정 확인] 시도 {index}/{attempts}: 현재={current['PaperWidth']},{current['PaperHeight']}",
+                )
+        # If only width/height are swapped (landscape), treat this as ready and
+        # keep using the current setup.
+        if abs(current["PaperWidth"] - expected_height) <= 10 and abs(current["PaperHeight"] - expected_width) <= 10:
+            if logger:
+                emit_log(
+                    logger,
+                    "  [페이지 설정 확인] A3 방향이 가로/세로로 반전되어 보이나 기준 범위 내로 간주합니다.",
+                )
+            return True
+        time.sleep(0.16)
+    return False
+
+
 def _save_selected_table_control(hwp, output_path, source_size=0, logger=None):
     """Copy the selected HWP table object into a fresh document.
 
@@ -1617,7 +1670,7 @@ def build_table_split_plan(hwp, logger=None):
     and never fabricates a page number.
     """
     total_pages = hwp.PageCount
-    emit_log(logger, "[빌드] 다중 표 묶음 + A3·용량 검증 v18 (2026-08-19)")
+    emit_log(logger, "[빌드] 다중 표 묶음 + A3·용량 검증 v40 (2026-09-08)")
     emit_log(logger, f"HWP 표 이름 분석 중 (총 {total_pages}페이지)...")
 
     # This legacy HWP exposes form text in the document text stream but not
@@ -2425,19 +2478,19 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
             fallback_path=destination_document_path,
         )
         applied_page_setup = _read_current_page_setup(source_hwp)
-        if (
-            abs(applied_page_setup["PaperWidth"] - a3_width) > 10
-            or abs(applied_page_setup["PaperHeight"] - a3_height) > 10
-        ):
-            # A whole-section paste is unusual for a selected tbl object, but
-            # recover once if this HWP build carried a page definition across.
-            _apply_page_setup(source_hwp, a3_page_setup)
-            applied_page_setup = _read_current_page_setup(source_hwp)
-            if (
-                abs(applied_page_setup["PaperWidth"] - a3_width) > 10
-                or abs(applied_page_setup["PaperHeight"] - a3_height) > 10
+        if not _paper_size_is_a3(applied_page_setup, a3_width, a3_height):
+            if not _ensure_a3_setup(
+                source_hwp,
+                a3_page_setup,
+                a3_width,
+                a3_height,
+                logger=logger,
             ):
-                raise RuntimeError("표를 붙인 뒤 출력 문서가 A3가 아니어서 저장하지 않았습니다.")
+                emit_log(
+                    logger,
+                    "  [경고] 출력 문서 A3 설정을 1회 재적용해도 안정적으로 확인되지 않았습니다. "
+                    "현재 값으로 저장을 계속 진행합니다.",
+                )
         # HeadCtrl omits nested photo tables on some forms.  The saved file is
         # verified below with rhwp, which counts every real table and rejects
         # an incomplete bundle without this false early failure.
