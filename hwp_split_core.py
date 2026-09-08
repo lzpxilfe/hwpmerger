@@ -1,9 +1,9 @@
 import os
+import pywintypes
 import re
 import time
 import ctypes
 import gc
-import os
 import json
 import subprocess
 import sys
@@ -19,6 +19,12 @@ SPLIT_MODE_AUTO = "auto"
 SPLIT_MODE_N_PAGES = "n_pages"
 SPLIT_MODE_N_FILES = "n_files"
 SPLIT_MODE_TABLE_NAME = "table_name"
+
+# 0 keeps a single HWP 작업 창 alive for the whole split run.
+# Set to a positive number if memory pressure requires periodic restart.
+_HWP_RESTART_EVERY_N_TABLE_GROUPS = int(
+    os.getenv("HWP_RESTART_EVERY_N_TABLE_GROUPS", "0")
+)
 
 # This source document's final form title is stored as a non-text object, so
 # it is absent from GetTextFile even though the table itself is present.
@@ -67,12 +73,100 @@ def _is_hwp_memory_error(exc):
             "out of memory",
             "not enough memory",
             "insufficient memory",
-            # HWP 2018 often shows a Korean out-of-memory dialog first, then
-            # merely reports that FileNew failed to create a separate tab.
-            # Treat that aftermath as recyclable native-resource pressure too.
+        )
+    )
+
+
+def _is_hwp_tab_recovery_error(exc):
+    """Recognize transient HWP tab-switching failures that usually recover quickly."""
+    detail = f"{exc!s} {exc!r}".casefold()
+    return any(
+        marker in detail
+        for marker in (
             "a3 출력용 새 탭을 만들지 못했습니다",
             "a3 출력용 새 탭을 별도로 만들지 못했습니다",
+            "문서 탭 ID",
         )
+    )
+
+
+def _is_wrong_param_count_error(exc):
+    """Return True when a COM call fails due to mismatched argument count."""
+    detail = f"{exc!s} {exc!r}".casefold()
+    if isinstance(exc, pywintypes.com_error):
+        try:
+            hresult = exc.args[0]
+            if hresult in (-2147352562, 0x8002000E):
+                return True
+        except Exception:
+            pass
+    return any(
+        marker in detail
+        for marker in (
+            "매개 변수의 개수가 잘못되었습니다",
+            "wrong number of arguments",
+            "wrong number of params",
+            "parameter count",
+            "매개변수의 개수가 잘못",
+        )
+    )
+
+
+def _call_with_arg_compatibility(operation_name, callee, variants, logger=None):
+    """Try multiple signatures for version-dependent COM methods.
+
+    variants: list of (args tuple, kwargs dict)
+    """
+    last_error = None
+    for index, (args, kwargs) in enumerate(variants, start=1):
+        try:
+            if kwargs:
+                result = callee(*args, **kwargs)
+            else:
+                result = callee(*args)
+            if logger and index > 1:
+                emit_log(logger, f"  [호환성 보정] {operation_name}: 시그니처 {index}번으로 재시도 성공")
+            return result
+        except Exception as exc:
+            last_error = exc
+            if not _is_wrong_param_count_error(exc):
+                raise
+            continue
+    if logger:
+        emit_log(logger, f"[호환성 실패] {operation_name}: 시그니처 후보가 모두 실패했습니다.")
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"{operation_name}: 시그니처 후보가 비어 있습니다.")
+
+
+def _hwp_open(hwp, file_path, mode="HWP", forceopen="forceopen:true", logger=None):
+    path = str(file_path)
+    return _call_with_arg_compatibility(
+        "Open",
+        hwp.Open,
+        [((path, mode, forceopen), {}), ((path, mode), {}), ((path,), {})],
+        logger=logger,
+    )
+
+
+def _hwp_save_as(hwp, file_path, logger=None):
+    return _call_with_arg_compatibility(
+        "SaveAs",
+        hwp.SaveAs,
+        [
+            ((os.path.normpath(str(file_path)), "HWP"), {}),
+            ((os.path.normpath(str(file_path)),), {}),
+        ],
+        logger=logger,
+    )
+
+
+def _hwp_select_ctrl_by_instance(hwp, control_instance_id, logger=None):
+    return _call_with_arg_compatibility(
+        "SelectCtrl",
+        hwp.SelectCtrl,
+        [((control_instance_id, 1), {}), ((control_instance_id,), {})],
+        logger=logger,
     )
 
 
@@ -152,10 +246,7 @@ def _iterate_documents(hwp):
                 continue
             if not document:
                 continue
-            try:
-                identity = str(document.DocumentID)
-            except Exception:
-                identity = repr(document)
+            identity = _safe_document_id(document)
             if identity in seen:
                 continue
             seen.add(identity)
@@ -163,10 +254,53 @@ def _iterate_documents(hwp):
     return documents
 
 
+def _safe_document_id(document):
+    """Return best-effort document identity string."""
+    try:
+        if document is None:
+            return ""
+        return str(document.DocumentID)
+    except Exception:
+        return ""
+
+
+def _safe_active_document_id(hwp):
+    """Return active-document ID string, or '' on failure."""
+    try:
+        return str(hwp.XHwpDocuments.Active_XHwpDocument.DocumentID)
+    except Exception:
+        return ""
+
+
+def _safe_active_document(hwp):
+    try:
+        return hwp.XHwpDocuments.Active_XHwpDocument
+    except Exception:
+        return None
+
+
+def _safe_document_count(hwp):
+    """Read open-document count without raising if COM state is unstable."""
+    try:
+        return int(hwp.XHwpDocuments.Count)
+    except Exception:
+        return 0
+
+
+def _collect_document_ids(hwp):
+    """Collect open document IDs in stable order for diagnostics/recovery."""
+    ids = []
+    for document in _iterate_documents(hwp):
+        doc_id = _safe_document_id(document)
+        if doc_id and doc_id not in ids:
+            ids.append(doc_id)
+    return ids
+
+
 def _find_document_by_id(hwp, document_id):
     """Find an open document by ID using all supported lookup paths."""
     target = _normalize_document_path(document_id)
-    if not target:
+    if target == "":
         return None
     by_find = None
     try:
@@ -175,12 +309,18 @@ def _find_document_by_id(hwp, document_id):
         by_find = None
     if by_find is not None:
         return by_find
+
+    raw_candidates = {target}
+    try:
+        raw_candidates.add(str(int(document_id)))
+    except Exception:
+        pass
+    raw_candidates.add(str(document_id).strip())
+
     for document in _iterate_documents(hwp):
-        try:
-            if str(document.DocumentID) == target:
-                return document
-        except Exception:
-            continue
+        doc_id = _safe_document_id(document)
+        if doc_id and doc_id in raw_candidates:
+            return document
     return None
 
 
@@ -211,7 +351,7 @@ def _activate_document_object(hwp, document):
     except Exception:
         return False
     try:
-        return str(active_id) == str(document.DocumentID)
+        return _safe_document_id(document) == str(active_id)
     except Exception:
         return False
 
@@ -827,7 +967,7 @@ def _select_table_control(hwp, table_position):
         _trace_hwp_call(hwp, trace, "표 컨트롤 ID Cancel", lambda: hwp.Run("Cancel"))
         _trace_hwp_call(
             hwp, trace, f"표 컨트롤 ID SelectCtrl({control_instance_id!r}, 1)",
-            lambda: hwp.SelectCtrl(control_instance_id, 1), include_selected_range=True,
+            lambda: _hwp_select_ctrl_by_instance(hwp, control_instance_id), include_selected_range=True,
         )
         if _selected_control_id(hwp) == "tbl":
             return "tbl", "표 컨트롤 ID", trace
@@ -871,20 +1011,19 @@ def _select_table_control(hwp, table_position):
 def _document_tab_snapshot(hwp):
     """Return only document-tab metadata; it never reads document contents."""
     parts = []
+    active_id = _safe_active_document_id(hwp)
+    if active_id:
+        parts.append(f"현재 탭 ID={active_id}")
+    else:
+        parts.append("현재 탭 ID=읽기 실패")
     try:
-        parts.append(f"현재 탭 ID={hwp.XHwpDocuments.Active_XHwpDocument.DocumentID}")
-    except Exception as exc:
-        parts.append(f"현재 탭 ID 읽기 실패={_selection_exception(exc)}")
-    try:
-        count = hwp.XHwpDocuments.Count
+        count = _safe_document_count(hwp)
         parts.append(f"열린 탭 수={count}")
         try:
             open_ids = []
             for document in _iterate_documents(hwp):
-                try:
-                    open_ids.append(str(document.DocumentID))
-                except Exception:
-                    open_ids.append("?")
+                doc_id = _safe_document_id(document)
+                open_ids.append(doc_id or "?")
             if open_ids:
                 parts.append(f"열린 탭 ID 목록={open_ids}")
         except Exception:
@@ -892,6 +1031,28 @@ def _document_tab_snapshot(hwp):
     except Exception as exc:
         parts.append(f"열린 탭 수 읽기 실패={_selection_exception(exc)}")
     return ", ".join(parts)
+
+
+def _close_document_by_id(hwp, document_id):
+    """Close one document if it is open; leave an already-active source untouched."""
+    try:
+        document = _find_document_by_id(hwp, document_id)
+    except Exception:
+        return False
+    if document is None:
+        return False
+    try:
+        current = _safe_active_document_id(hwp)
+        if _safe_document_id(document) and _safe_document_id(document) == current:
+            return False
+    except Exception:
+        pass
+    try:
+        document.Modified = False
+        document.Close(False)
+        return True
+    except Exception:
+        return False
 
 
 def _activate_document_by_id(hwp, document_id, fallback_path=None):
@@ -902,28 +1063,40 @@ def _activate_document_by_id(hwp, document_id, fallback_path=None):
     ``XHwpDocuments`` is independent of table names and works for every tab.
     """
     fallback_path = _normalize_document_path(fallback_path)
-    last_active_id = None
+    last_active_id = ""
+    document_id = _normalize_document_path(document_id) or str(document_id).strip()
     for attempt in range(15):
+        if not document_id:
+            break
+
+        # Best case: the active tab is already the target.
+        active = _safe_active_document_id(hwp)
+        if active == document_id:
+            current = _safe_active_document(hwp)
+            if current is not None:
+                return current
+
         document = _find_document_by_id(hwp, document_id)
-        if document is None:
-            if fallback_path:
-                document = _find_document_by_path(hwp, fallback_path)
-            if document is None:
-                last_active_id = None
+        if document is None and fallback_path:
+            document = _find_document_by_path(hwp, fallback_path)
         if document is not None and _activate_document_object(hwp, document):
             return document
-        try:
-            active_id = hwp.XHwpDocuments.Active_XHwpDocument.DocumentID
-            last_active_id = active_id
-        except Exception as exc:
-            last_active_id = f"읽기 실패({_selection_exception(exc)})"
+        if document is not None and fallback_path:
+            # One late fallback path for cases where HWP rewrites DocumentID after
+            # a failed tab transition (rare, but observed on long A3 runs).
+            fallback_doc = _find_document_by_path(hwp, fallback_path)
+            if fallback_doc is not None and _activate_document_object(hwp, fallback_doc):
+                return fallback_doc
+
+        last_active_id = _safe_active_document_id(hwp) or "읽기 실패"
         # HWP 2018 sometimes acknowledges Open/FileNew before its document
         # tab manager is ready to activate another tab.  Reacquire the live
         # document object rather than reusing the previous COM reference.
-        time.sleep(0.1)
+        # Short wait grows with attempts so slow transitions can catch up.
+        time.sleep(0.06 + attempt * 0.04)
     raise _HwpTabActivationError(
         f"문서 탭 ID {document_id} 활성화에 실패했습니다 "
-        f"(현재 탭 ID {last_active_id}, 열린 탭 수 {hwp.XHwpDocuments.Count})."
+        f"(현재 탭 ID {last_active_id}, 열린 탭 수 {_safe_document_count(hwp)})."
     )
 
 
@@ -1005,7 +1178,7 @@ def _save_table_at_position(hwp, position, output_path):
         time.sleep(0.12)
         hwp.HAction.Run("Paste")
         time.sleep(0.2)
-        hwp.SaveAs(os.path.normpath(str(output_path)), "HWP")
+        _hwp_save_as(hwp, output_path, logger=logger)
         time.sleep(0.2)
     finally:
         hwp.HAction.Run("FileClose")
@@ -1073,7 +1246,7 @@ def _save_selected_table_control(hwp, output_path, source_size=0, logger=None):
         time.sleep(0.15)
         hwp.HAction.Run("Paste")
         time.sleep(0.25)
-        hwp.SaveAs(os.path.normpath(str(output_path)), "HWP")
+        _hwp_save_as(hwp, output_path, logger=logger)
         time.sleep(0.25)
     except Exception as exc:
         raise RuntimeError(f"표 개체를 새 문서로 저장하지 못했습니다: {exc}") from exc
@@ -1143,7 +1316,7 @@ def _execute_split_by_table_controls_legacy(input_path, output_dir, names, patte
     saved = []
     try:
         emit_log(logger, "원본 HWP를 여는 중...")
-        hwp.Open(str(input_path), "HWP", "forceopen:true")
+        _hwp_open(hwp, input_path, logger=logger)
         emit_log(logger, f"인식된 표 {total}개를 이름으로 찾아 분리합니다...")
         final_table_position = None
         for index, name in enumerate(names, start=1):
@@ -1298,7 +1471,7 @@ def _save_table_by_site_name(hwp, site_name, output_path, logger=None):
         time.sleep(0.15)
         hwp.HAction.Run("Paste")
         time.sleep(0.25)
-        hwp.SaveAs(norm_path, "HWP")
+        _hwp_save_as(hwp, norm_path, logger=logger)
         time.sleep(0.25)
     except Exception as exc:
         raise RuntimeError(f"'{site_name}' 새 문서 저장 실패: {exc}") from exc
@@ -1469,7 +1642,7 @@ def _save_exact_page_range(hwp, start_page, end_page, output_path, logger=None):
         time.sleep(0.2)
         hwp.HAction.Run("Paste")
         time.sleep(0.25)
-        hwp.SaveAs(norm_path, "HWP")
+        _hwp_save_as(hwp, norm_path, logger=logger)
         time.sleep(0.25)
     except Exception as exc:
         raise RuntimeError(f"새 문서로 저장하지 못했습니다: {exc}") from exc
@@ -1699,7 +1872,7 @@ def _execute_split_by_logical_blocks_unsupported(input_path, output_dir, names, 
     saved = []
     try:
         emit_log(logger, "원본 HWP를 여는 중...")
-        hwp.Open(str(input_path), "HWP", "forceopen:true")
+        _hwp_open(hwp, input_path, logger=logger)
         emit_log(logger, f"인식된 표 {total}개를 시작점-다음 시작점 범위로 분리합니다...")
         starts = _logical_record_starts(hwp, names, logger)
         hwp.Run("MoveDocEnd")
@@ -1759,7 +1932,7 @@ def _save_selected_table_in_fresh_hwp(source_hwp, output_path, source_size, logg
         source_hwp.HAction.Run("Copy")
         destination_document.SetActive_XHwpDocument()
         source_hwp.HAction.Run("Paste")
-        source_hwp.SaveAs(os.path.normpath(str(output_path)), "HWP")
+        _hwp_save_as(source_hwp, output_path, logger=logger)
         time.sleep(0.2)
     finally:
         try:
@@ -1798,7 +1971,7 @@ def _execute_single_table_legacy(input_path, output_dir, names, pattern="{name}"
     saved = []
     try:
         emit_log(logger, "원본 HWP를 여는 중...")
-        source_hwp.Open(str(input_path), "HWP", "forceopen:true")
+        _hwp_open(source_hwp, input_path, logger=logger)
         emit_log(logger, f"인식된 표 {total}개를 실제 표 개체로 저장합니다...")
         last_table_position = None
         for index, name in enumerate(names, start=1):
@@ -1933,79 +2106,6 @@ def _count_top_level_tables(hwp):
     return count
 
 
-def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, logger=None):
-    """Save all table controls in one logical record into one A3 HWP file."""
-    if not positions:
-        raise RuntimeError("저장할 표 개체 묶음이 비어 있습니다.")
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    source_document = source_hwp.XHwpDocuments.Active_XHwpDocument
-    source_document_id = source_document.DocumentID
-    source_hwp.SetPos(*positions[0])
-    source_page_setup = _read_current_page_setup(source_hwp)
-    emit_log(logger, f"  표 개체 {len(positions)}개를 같은 파일에 저장 중...")
-
-    destination_document = None
-    try:
-        destination_document = source_hwp.XHwpDocuments.Add(True)
-        destination_document.SetActive_XHwpDocument()
-        for number, position in enumerate(positions, start=1):
-            source_hwp.XHwpDocuments.FindItem(source_document_id).SetActive_XHwpDocument()
-            source_hwp.SetPos(*position)
-            if source_hwp.FindCtrl() != "tbl":
-                raise RuntimeError(f"묶음의 {number}번째 표 개체를 선택하지 못했습니다.")
-            source_hwp.HAction.Run("Copy")
-            destination_document.SetActive_XHwpDocument()
-            if number > 1:
-                source_hwp.Run("MoveDocEnd")
-                source_hwp.Run("BreakPara")
-            source_hwp.HAction.Run("Paste")
-
-        destination_document.SetActive_XHwpDocument()
-        # Apply the source A3 setup after pasting so pasted content cannot
-        # replace the destination section's paper definition with A4.
-        _apply_page_setup(source_hwp, source_page_setup)
-        applied_page_setup = _read_current_page_setup(source_hwp)
-        if (
-            applied_page_setup["PaperWidth"] != source_page_setup["PaperWidth"]
-            or applied_page_setup["PaperHeight"] != source_page_setup["PaperHeight"]
-        ):
-            raise RuntimeError("출력 탭의 용지 크기가 원본 A3 설정과 다릅니다. 저장하지 않습니다.")
-        saved_table_count = _count_top_level_tables(source_hwp)
-        if saved_table_count < len(positions):
-            raise RuntimeError(
-                f"표 {len(positions)}개 중 {saved_table_count}개만 결과 탭에 들어갔습니다. 저장하지 않습니다."
-            )
-        source_hwp.SaveAs(os.path.normpath(str(output_path)), "HWP")
-        time.sleep(0.2)
-    finally:
-        try:
-            if destination_document is not None:
-                destination_document.Modified = False
-                destination_document.Close(False)
-            source_hwp.XHwpDocuments.FindItem(source_document_id).SetActive_XHwpDocument()
-        except Exception:
-            pass
-
-    if not output_path.exists() or output_path.stat().st_size == 0:
-        raise RuntimeError(f"표 묶음 결과 파일을 찾지 못했습니다: {output_path.name}")
-    saved_size = output_path.stat().st_size
-    if source_size and saved_size >= source_size * 0.25:
-        raise RuntimeError(f"원본 전체가 저장된 것으로 보입니다 ({saved_size / 1024 / 1024:.1f} MB).")
-    if saved_size < 96 * 1024:
-        raise RuntimeError(
-            f"결과가 {saved_size / 1024:.1f} KB뿐이라 표 내용 또는 사진이 빠진 것으로 보입니다. "
-            "정상 분리로 처리하지 않습니다."
-        )
-    paper_width_mm = source_page_setup["PaperWidth"] / 283.465
-    paper_height_mm = source_page_setup["PaperHeight"] / 283.465
-    emit_log(
-        logger,
-        f"  표 묶음 저장 완료: {output_path.name} ({saved_size / 1024:.1f} KB, "
-        f"표 {len(positions)}개, 용지 {paper_width_mm:.0f}×{paper_height_mm:.0f} mm)",
-    )
-
-
 def _verify_saved_table_bundle(output_path, expected_name, expected_table_count):
     """Fail closed when a saved file lost its header or a photo table."""
     payload = _run_rhwp_json(["export-tables", output_path, "--json"])
@@ -2052,42 +2152,98 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
     if working_path.exists():
         working_path.unlink()
 
-    source_document = source_hwp.XHwpDocuments.Active_XHwpDocument
-    source_document_id = source_document.DocumentID
+    source_document = _safe_active_document(source_hwp)
+    if source_document is None:
+        raise RuntimeError("현재 원본 탭을 읽을 수 없습니다.")
+    source_document_id = _safe_document_id(source_document)
+    if not source_document_id:
+        raise RuntimeError("원본 탭의 ID를 읽지 못했습니다.")
     source_document_path = _read_document_path(source_document)
     destination_document = None
+    destination_document_id = ""
+    destination_document_path = ""
     a3_page_setup = None
     try:
         # HWP 2018 reuses the active tab for Open().  First create a blank tab,
         # then load the real A3 template into that tab.  The source therefore
         # remains a separate document and the destination has an actual A3
         # section before any table is pasted.
-        _activate_document_by_id(source_hwp, source_document_id, fallback_path=source_document_path)
         a3_width, a3_height = _a3_template_dimensions()
-        source_hwp.HAction.Run("FileNew")
-        time.sleep(0.15)
-        blank_document = source_hwp.XHwpDocuments.Active_XHwpDocument
-        if blank_document.DocumentID == source_document_id:
+        template_path = _normalize_document_path(_a3_template_hwp_path())
+        # Close stale template documents that might have survived a previous run.
+        for candidate_id in list(_collect_document_ids(source_hwp)):
+            if candidate_id == source_document_id:
+                continue
+            candidate = _find_document_by_id(source_hwp, candidate_id)
+            if candidate is None:
+                continue
+            if _read_document_path(candidate) == template_path:
+                _close_document_by_id(source_hwp, candidate_id)
+        source_snapshot_ids = _collect_document_ids(source_hwp)
+
+        for attempt in range(3):
+            _activate_document_by_id(source_hwp, source_document_id, fallback_path=source_document_path)
+            source_hwp.HAction.Run("FileNew")
+            time.sleep(0.18)
+            after_snapshot = _collect_document_ids(source_hwp)
+            new_ids = [
+                doc_id for doc_id in after_snapshot
+                if doc_id and doc_id not in source_snapshot_ids and doc_id != source_document_id
+            ]
+            if not new_ids:
+                active_after_new = _safe_active_document_id(source_hwp)
+                if active_after_new and active_after_new != source_document_id:
+                    new_ids = [active_after_new]
+            if not new_ids:
+                if attempt == 2:
+                    break
+                time.sleep(0.12)
+                continue
+            candidate_id = new_ids[-1]
+            destination_document = _find_document_by_id(source_hwp, candidate_id)
+            if destination_document is None:
+                if attempt == 2:
+                    break
+                time.sleep(0.12)
+                continue
+            _activate_document_by_id(
+                source_hwp,
+                candidate_id,
+                fallback_path=_read_document_path(destination_document),
+            )
+            _hwp_open(source_hwp, _a3_template_hwp_path(), logger=logger)
+            time.sleep(0.18)
+            destination_document = _safe_active_document(source_hwp)
+            destination_document_id = _safe_document_id(destination_document)
+            destination_document_path = _read_document_path(destination_document)
+            if destination_document_id and destination_document_id != source_document_id:
+                break
+            if attempt < 2:
+                time.sleep(0.12)
+        if not destination_document_id or destination_document_id == source_document_id:
             raise RuntimeError("A3 출력용 새 탭을 만들지 못했습니다.")
-        source_hwp.Open(str(_a3_template_hwp_path()), "HWP", "forceopen:true")
-        time.sleep(0.15)
-        destination_document = source_hwp.XHwpDocuments.Active_XHwpDocument
-        destination_document_id = destination_document.DocumentID
-        destination_document_path = _read_document_path(destination_document)
-        if destination_document.DocumentID == source_document_id:
+        if _find_document_by_id(source_hwp, destination_document_id) is None:
             raise RuntimeError("A3 출력용 새 탭을 별도로 만들지 못했습니다.")
+
         a3_page_setup = _read_current_page_setup(source_hwp)
         if (
             abs(a3_page_setup["PaperWidth"] - a3_width) > 10
             or abs(a3_page_setup["PaperHeight"] - a3_height) > 10
         ):
             raise RuntimeError("A3 바탕 문서가 297×420 mm로 열리지 않았습니다.")
-        if blank_document.DocumentID != destination_document.DocumentID:
-            blank_document.Modified = False
-            blank_document.Close(False)
+        for stale_candidate_id in source_snapshot_ids:
+            if stale_candidate_id in (source_document_id, destination_document_id):
+                continue
+            stale_candidate = _find_document_by_id(source_hwp, stale_candidate_id)
+            if stale_candidate is None:
+                continue
+            stale_path = _read_document_path(stale_candidate)
+            if stale_path == template_path or stale_path == "":
+                _close_document_by_id(source_hwp, stale_candidate_id)
 
         emit_log(logger, f"  A3 바탕 탭에 표 {len(positions)}개를 넣는 중...")
         for number, position in enumerate(positions, start=1):
+            emit_log(logger, f"  [단계] 표 {number}/{len(positions)} 선택/복사/붙여넣기 시작")
             tab_before_activation = _document_tab_snapshot(source_hwp)
             _activate_document_by_id(source_hwp, source_document_id, fallback_path=source_document_path)
             tab_after_activation = _document_tab_snapshot(source_hwp)
@@ -2120,6 +2276,7 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
                     f"(시도: {selection_route}; 한글 응답: {found_control or '없음'})."
                 )
             source_hwp.HAction.Run("Copy")
+            emit_log(logger, f"  [단계] 표 {number}/{len(positions)} 복사 완료")
             # Copy/Paste is an unavoidable HWP 2018 clipboard handoff.  Take
             # the sequence after HWP has populated it, then reject a paste if
             # another application copied something while the destination tab
@@ -2135,7 +2292,9 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
             source_hwp.Run("MoveDocEnd")
             if number > 1:
                 source_hwp.Run("BreakPara")
+            emit_log(logger, f"  [단계] 표 {number}/{len(positions)} 붙여넣기 실행")
             source_hwp.HAction.Run("Paste")
+            _apply_page_setup(source_hwp, a3_page_setup)
 
         _activate_document_by_id(
             source_hwp,
@@ -2159,7 +2318,8 @@ def _save_table_group_in_tab(source_hwp, positions, output_path, source_size, ex
         # HeadCtrl omits nested photo tables on some forms.  The saved file is
         # verified below with rhwp, which counts every real table and rejects
         # an incomplete bundle without this false early failure.
-        source_hwp.SaveAs(os.path.normpath(str(working_path)), "HWP")
+        emit_log(logger, "  [단계] 임시 저장본 저장 실행")
+        _hwp_save_as(source_hwp, working_path, logger=logger)
         time.sleep(0.2)
     except Exception:
         try:
@@ -2217,13 +2377,20 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
     saved = []
     try:
         emit_log(logger, "원본 HWP를 여는 중...")
-        hwp.Open(str(input_path), "HWP", "forceopen:true")
+        _hwp_open(hwp, input_path, logger=logger)
         planned_names, groups = _table_groups_for_names(
             input_path, hwp, preview_names=names, logger=logger
         )
         total = len(planned_names)
         output_plan = build_table_output_plan(planned_names, pattern)
         newly_saved_since_restart = 0
+        if _HWP_RESTART_EVERY_N_TABLE_GROUPS > 0:
+            emit_log(
+                logger,
+                f"[설정] 주기적 HWP 재시작: {_HWP_RESTART_EVERY_N_TABLE_GROUPS}개 묶음 저장 후 메모리 정리"
+            )
+        else:
+            emit_log(logger, "[설정] 주기적 재시작 비활성: 같은 HWP 창을 유지합니다.")
 
         def restart_source_hwp(reason):
             """Recycle HWP's native image/document memory without losing work."""
@@ -2245,7 +2412,7 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
                 visible=True, logger=logger, progress_callback=progress_callback
             )
             emit_log(logger, "원본 HWP를 다시 여는 중...")
-            hwp.Open(str(input_path), "HWP", "forceopen:true")
+            _hwp_open(hwp, input_path, logger=logger)
             reopened_names, reopened_groups = _table_groups_for_names(
                 input_path, hwp, preview_names=planned_names, logger=logger
             )
@@ -2259,6 +2426,16 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
                     "안전하게 중단했습니다."
                 )
             groups = reopened_groups
+
+        def recover_without_restart(reason):
+            """Try a lightweight, in-process recovery before restarting the app."""
+            emit_log(logger, f"  [복구] {reason} — 창을 유지한 채 1회 재시도합니다.")
+            try:
+                hwp.Run("Cancel")
+            except Exception:
+                pass
+            gc.collect()
+            time.sleep(0.35)
 
         if groups and groups[0]:
             # This non-destructive probe runs before an A3 tab exists.  The
@@ -2328,17 +2505,19 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
                         )
                         break
                     except _HwpTabActivationError:
-                        # A tab activation failure is often the first visible
-                        # symptom of HWP 2018 exhausting native document/image
-                        # resources.  Do not keep retrying the same process:
-                        # restart it, reopen the unchanged source, then retry
-                        # the current group from its fresh control locators.
+                        # A tab activation failure is usually a transient
+                        # document-manager synchronization issue.  Retry with the
+                        # same HWP process first; only restart on repeated
+                        # failures.
                         if clipboard_attempt == 3:
                             raise RuntimeError(
                                 "한글이 임시 A3 탭을 정리한 뒤에도 원본 탭으로 돌아가지 못했습니다. "
                                 "이 묶음은 저장하지 않았습니다."
                             )
-                        restart_source_hwp("임시 A3 탭 전환 오류/한글 자원 부족 복구")
+                        if clipboard_attempt == 2:
+                            restart_source_hwp("임시 A3 탭 전환 오류 재시작")
+                        else:
+                            recover_without_restart("임시 A3 탭 전환 오류")
                         positions = groups[group_index]
                     except _ClipboardInterferenceError:
                         if clipboard_attempt == 3:
@@ -2353,6 +2532,18 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
                             f"({clipboard_attempt}/3)...",
                         )
                     except Exception as exc:
+                        if _is_hwp_tab_recovery_error(exc):
+                            if clipboard_attempt == 3:
+                                raise RuntimeError(
+                                    "한글이 임시 A3 탭 상태를 복구하지 못해 이 묶음을 건너뛰었습니다. "
+                                    "실행을 잠시 중단 후 다시 시도해 주세요."
+                                ) from exc
+                            if clipboard_attempt == 2:
+                                restart_source_hwp("임시 A3 탭 동기화 오류 재시작")
+                            else:
+                                recover_without_restart("임시 A3 탭 동기화 오류")
+                            positions = groups[group_index]
+                            continue
                         if not _is_hwp_memory_error(exc):
                             raise
                         if clipboard_attempt == 3:
@@ -2360,8 +2551,12 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
                                 "한글이 메모리 부족을 반복 보고해 이 표 묶음을 저장하지 않았습니다. "
                                 "다른 한글 문서를 닫은 뒤 다시 실행해 주세요."
                             ) from exc
-                        restart_source_hwp("한글 메모리 부족 복구")
+                        if clipboard_attempt == 2:
+                            restart_source_hwp("한글 메모리 부족 복구")
+                        else:
+                            recover_without_restart("한글 메모리 부족 경미한 동기화 오류")
                         positions = groups[group_index]
+                        continue
             except RuntimeError as exc:
                 # Do not replace the normal rhwp/control-order workflow with
                 # title searches.  Recover only after the saved result proves
@@ -2401,10 +2596,16 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
             # Photo-heavy A3 tables are handled by HWP's native process, not
             # Python's heap.  Recycling that process in bounded batches keeps
             # its unreleased image/document handles from accumulating through
-            # a 100+ record job.  Existing verified outputs are skipped and do
-            # not count toward this limit.
-            if newly_saved_since_restart >= 12:
-                restart_source_hwp("사진 표 12개 묶음 저장 후 메모리 정리")
+            # long runs, but only when an explicit interval is configured.
+            # Existing verified outputs are skipped and do not count toward this
+            # limit.
+            if (
+                _HWP_RESTART_EVERY_N_TABLE_GROUPS
+                and newly_saved_since_restart >= _HWP_RESTART_EVERY_N_TABLE_GROUPS
+            ):
+                restart_source_hwp(
+                    f"사진 표 {_HWP_RESTART_EVERY_N_TABLE_GROUPS}개 묶음 저장 후 메모리 정리"
+                )
                 newly_saved_since_restart = 0
         emit_progress(progress_callback, {"type": "progress", "current": total, "total": total, "status": "분리 완료"})
         return saved
@@ -2448,7 +2649,7 @@ def execute_split_by_plan(
     hwp = get_hwp_application(visible=True, logger=logger, progress_callback=progress_callback)
 
     emit_log(logger, f"한글 원본 문서 열기: {input_path.name}")
-    hwp.Open(str(input_path), "HWP", "forceopen:true")
+    _hwp_open(hwp, input_path, logger=logger)
     time.sleep(0.8)
 
     total = len(page_ranges)
@@ -2531,7 +2732,7 @@ def split_hwp_file(
     hwp = get_hwp_application(visible=visible, logger=logger, progress_callback=progress_callback)
 
     emit_log(logger, f"파일 열기: {input_path.name}")
-    hwp.Open(str(input_path), "HWP", "forceopen:true")
+    _hwp_open(hwp, input_path, logger=logger)
     time.sleep(0.5)
 
     total_pages = hwp.PageCount
