@@ -150,15 +150,77 @@ def _hwp_open(hwp, file_path, mode="HWP", forceopen="forceopen:true", logger=Non
 
 
 def _hwp_save_as(hwp, file_path, logger=None):
-    return _call_with_arg_compatibility(
-        "SaveAs",
-        hwp.SaveAs,
-        [
-            ((os.path.normpath(str(file_path)), "HWP"), {}),
-            ((os.path.normpath(str(file_path)),), {}),
-        ],
-        logger=logger,
-    )
+    target = os.path.normpath(str(file_path))
+    try:
+        return _call_with_arg_compatibility(
+            "SaveAs",
+            hwp.SaveAs,
+            [
+                ((target, "HWP"), {}),
+                ((target, "HWP", 0), {}),
+                ((target, 0), {}),
+                ((target, True), {}),
+                ((target,), {}),
+            ],
+            logger=logger,
+        )
+    except Exception:
+        return _hwp_save_as_via_action(hwp, target, logger=logger)
+
+
+def _hwp_save_as_via_action(hwp, file_path, logger=None):
+    """Fallback to action-based save when COM SaveAs signatures differ by version."""
+    target = os.path.normpath(str(file_path))
+    last_error = None
+    actions = ("FileSaveAs", "SaveAs", "Save")
+
+    for action_name in actions:
+        try:
+            try:
+                hset = hwp.HParameterSet.HFileOpenSave
+                hwp.HAction.GetDefault(action_name, hset.HSet)
+            except Exception:
+                continue
+
+            filename_set = False
+            for key in ("filename", "FileName", "filepath", "FilePath"):
+                try:
+                    setattr(hset, key, target)
+                    filename_set = True
+                    break
+                except Exception:
+                    continue
+            if not filename_set:
+                continue
+
+            # Keep this minimal: most builds are fine with Format + Attributes 1.
+            for key in ("Format", "format"):
+                try:
+                    setattr(hset, key, "HWP")
+                    break
+                except Exception:
+                    continue
+            for key in ("Attributes", "attribute", "Mode"):
+                try:
+                    setattr(hset, key, 1)
+                    break
+                except Exception:
+                    continue
+
+            if hwp.HAction.Execute(action_name, hset.HSet):
+                return target
+        except Exception as exc:
+            last_error = exc
+            continue
+
+    if logger:
+        emit_log(
+            logger,
+            f"[저장 방법 실패] SaveAs 대체 루트를 모두 시도했지만 실패했습니다: {last_error!r}",
+        )
+    if last_error is None:
+        last_error = RuntimeError("SaveAs 대체 루트 실행 실패")
+    raise last_error
 
 
 def _hwp_select_ctrl_by_instance(hwp, control_instance_id, logger=None):
