@@ -21,11 +21,15 @@ SPLIT_MODE_N_PAGES = "n_pages"
 SPLIT_MODE_N_FILES = "n_files"
 SPLIT_MODE_TABLE_NAME = "table_name"
 
-# 0 keeps a single HWP 작업 창 alive for the whole split run.
-# Set to a positive number if memory pressure requires periodic restart.
+# Legacy optional batch recycling.  Independent-table mode below takes
+# precedence because photo-heavy HWP documents can leak native handles even
+# after their temporary output tab is closed.
 _HWP_RESTART_EVERY_N_TABLE_GROUPS = int(
     os.getenv("HWP_RESTART_EVERY_N_TABLE_GROUPS", "0")
 )
+_HWP_ISOLATE_EACH_TABLE_GROUP = os.getenv(
+    "HWP_ISOLATE_EACH_TABLE_GROUP", "1"
+).strip().casefold() not in {"0", "false", "no", "off"}
 
 # This source document's final form title is stored as a non-text object, so
 # it is absent from GetTextFile even though the table itself is present.
@@ -41,7 +45,7 @@ _APP_ROOTS = (
 _RHWP_RELATIVE_PATH = Path("tools") / "rhwp" / "rhwp" / "rhwp.exe"
 _A3_TEMPLATE_HWP_RELATIVE_PATH = Path("resources") / "a3_blank.hwp"
 _A3_TEMPLATE_HWPX_RELATIVE_PATH = Path("resources") / "a3_blank.hwpx"
-_SPLIT_BUILD_VERSION = "v41"
+_SPLIT_BUILD_VERSION = "v42"
 _MAX_TABLE_GROUP_ATTEMPTS = 3
 
 
@@ -83,7 +87,7 @@ def _load_split_journal(path, input_path, output_plan, groups):
         pass
     if not isinstance(journal, dict) or journal.get("source_sha256") != source_hash:
         journal = {
-            "format": "hwpmerger-split-v41",
+            "format": "hwpmerger-split-v42",
             "source_path": str(Path(input_path)),
             "source_sha256": source_hash,
             "items": {},
@@ -1741,7 +1745,7 @@ def build_table_split_plan(hwp, logger=None):
     and never fabricates a page number.
     """
     total_pages = hwp.PageCount
-    emit_log(logger, "[빌드] 다중 표 묶음 + 단계별 저장 검산 v41 (2026-09-08)")
+    emit_log(logger, "[빌드] 다중 표 묶음 + 유적별 독립 한글 작업 v42 (2026-09-08)")
     emit_log(logger, f"HWP 표 이름 분석 중 (총 {total_pages}페이지)...")
 
     # This legacy HWP exposes form text in the document text stream but not
@@ -2715,12 +2719,19 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
         )
         total = len(planned_names)
         output_plan = build_table_output_plan(planned_names, pattern)
-        journal_path = output_dir / "hwp_split_v41_journal.json"
+        journal_path = output_dir / "hwp_split_v42_journal.json"
         journal = _load_split_journal(journal_path, input_path, output_plan, groups)
         failed = []
         existing_count = 0
         newly_saved_since_restart = 0
-        if _HWP_RESTART_EVERY_N_TABLE_GROUPS > 0:
+        group_sizes = [len(group) for group in groups]
+        expected_physical_table_count = sum(group_sizes)
+        if _HWP_ISOLATE_EACH_TABLE_GROUP:
+            emit_log(
+                logger,
+                "[설정] 유적 묶음 독립 작업 모드: 매 묶음 뒤 한글 작업 창을 새로 시작합니다.",
+            )
+        elif _HWP_RESTART_EVERY_N_TABLE_GROUPS > 0:
             emit_log(
                 logger,
                 f"[설정] 주기적 HWP 재시작: {_HWP_RESTART_EVERY_N_TABLE_GROUPS}개 묶음 저장 후 메모리 정리"
@@ -2749,19 +2760,40 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
             )
             emit_log(logger, "원본 HWP를 다시 여는 중...")
             _hwp_open(hwp, input_path, logger=logger)
-            reopened_names, reopened_groups = _table_groups_for_names(
-                input_path, hwp, preview_names=planned_names, logger=logger
-            )
-            if reopened_names != planned_names:
-                try:
-                    hwp.Quit()
-                except Exception:
-                    pass
-                raise RuntimeError(
-                    "한글 작업 창을 다시 연 뒤 표 구조가 처음 분석 결과와 달라 "
-                    "안전하게 중단했습니다."
+            if _HWP_ISOLATE_EACH_TABLE_GROUP:
+                # rhwp has already fixed the table boundaries before the run.
+                # Re-reading only HWP's live controls avoids repeatedly parsing
+                # the entire document while still rejecting a changed table stream.
+                refreshed_positions = _table_control_positions(hwp, keep_control=True)
+                if len(refreshed_positions) != expected_physical_table_count:
+                    try:
+                        hwp.Quit()
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        "독립 작업 창에서 원본 표 개수가 처음 분석 결과와 달라 "
+                        f"안전하게 중단했습니다 ({len(refreshed_positions)} / {expected_physical_table_count})."
+                    )
+                cursor = 0
+                refreshed_groups = []
+                for size in group_sizes:
+                    refreshed_groups.append(refreshed_positions[cursor:cursor + size])
+                    cursor += size
+                groups = refreshed_groups
+            else:
+                reopened_names, reopened_groups = _table_groups_for_names(
+                    input_path, hwp, preview_names=planned_names, logger=logger
                 )
-            groups = reopened_groups
+                if reopened_names != planned_names:
+                    try:
+                        hwp.Quit()
+                    except Exception:
+                        pass
+                    raise RuntimeError(
+                        "한글 작업 창을 다시 연 뒤 표 구조가 처음 분석 결과와 달라 "
+                        "안전하게 중단했습니다."
+                    )
+                groups = reopened_groups
 
         def recover_without_restart(reason):
             """Try a lightweight, in-process recovery before restarting the app."""
@@ -2772,6 +2804,11 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
                 pass
             gc.collect()
             time.sleep(0.35)
+
+        def isolate_after_group(reason, group_index):
+            """Discard HWP's image/clipboard state before the next record."""
+            if _HWP_ISOLATE_EACH_TABLE_GROUP and group_index + 1 < total:
+                restart_source_hwp(reason)
 
         if groups and groups[0]:
             # This non-destructive probe runs before an A3 tab exists.  The
@@ -2813,6 +2850,11 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
                 if candidate["base_key"] == item["base_key"]
             )
         }
+        if _HWP_ISOLATE_EACH_TABLE_GROUP:
+            # The analysis window never copies content, but do not reuse it
+            # for the first output either.  Every saved record then starts in
+            # the same clean process state.
+            restart_source_hwp("표 구조 분석용 작업 창 정리")
         for group_index, (item, positions) in enumerate(zip(output_plan, groups)):
             index = item["index"]
             name = item["name"]
@@ -2929,6 +2971,7 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
                         "type": "progress", "current": index, "total": total,
                         "status": f"실패 기록 후 다음 묶음 진행 ({index}/{total})",
                     })
+                    isolate_after_group("실패한 유적 묶음 격리 정리", group_index)
                     continue
                 next_name = (
                     output_plan[group_index + 1]["name"]
@@ -2969,6 +3012,7 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
                         output_path=str(output_path), error=str(correction_exc),
                     )
                     emit_log(logger, f"  [실패 기록] 제목 경계 복구도 실패: {output_path.name}: {correction_exc}")
+                    isolate_after_group("제목 경계 복구 실패 묶음 격리 정리", group_index)
                     continue
             saved.append(output_path)
             _checkpoint_split_item(
@@ -2983,7 +3027,10 @@ def execute_split_by_table_controls(input_path, output_dir, names, pattern="{nam
             # long runs, but only when an explicit interval is configured.
             # Existing verified outputs are skipped and do not count toward this
             # limit.
-            if (
+            if _HWP_ISOLATE_EACH_TABLE_GROUP:
+                isolate_after_group("유적 묶음 저장 후 독립 작업 창 정리", group_index)
+                newly_saved_since_restart = 0
+            elif (
                 _HWP_RESTART_EVERY_N_TABLE_GROUPS
                 and newly_saved_since_restart >= _HWP_RESTART_EVERY_N_TABLE_GROUPS
             ):

@@ -510,7 +510,7 @@ class SplitTab:
     def _preview_worker(self, input_file, mode, n, pattern):
         pythoncom.CoInitialize()
         q = self.message_queue
-        q.put({"type": "log", "message": "[빌드] rhwp 표 구조 + 단계별 저장 검산 v41 (2026-09-08)"})
+        q.put({"type": "log", "message": "[빌드] rhwp 표 구조 + 유적별 독립 한글 작업 v42 (2026-09-08)"})
 
         def logger(msg):
             q.put({"type": "log", "message": msg})
@@ -755,7 +755,7 @@ class SplitTab:
 class HwpMergerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("HWP 파일 병합/분리기 - rhwp 표 구조 · 단계별 저장 검산 v41")
+        self.root.title("HWP 파일 병합/분리기 - rhwp 표 구조 · 유적별 독립 한글 작업 v42")
         self.root.geometry("880x740")
         self.root.minsize(760, 620)
 
